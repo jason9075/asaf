@@ -37,6 +37,7 @@
             pythonEnv
             pkgs.just
             pkgs.sqlite
+            pkgs.visidata
           ];
 
           shellHook = ''

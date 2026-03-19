@@ -3,11 +3,12 @@
 
 set dotenv-load := true
 
-input  := "raw_json/gossip.json"
-jsonl  := "data/messages.jsonl"
-segs   := "data/sessions.jsonl"
-frags  := "data/fragments.jsonl"
+input   := "raw_json/gossip.json"
+jsonl   := "data/messages.jsonl"
+segs    := "data/sessions.jsonl"
+frags   := "data/fragments.jsonl"
 profile := "data/profile.md"
+target  := ""
 
 # List all available targets
 default:
@@ -24,9 +25,7 @@ ingest:
 segment: ingest
     python segment.py --input {{jsonl}} --output {{segs}}
 
-# Stage 3: extract personality fragments via LLM
-# Override target: just profile target=<author_id>
-target := ""
+# Stage 3 (Claude): extract personality fragments — just profile target=<author_id>
 profile: segment
     python profile.py --input {{segs}} --output {{frags}} \
         $([ -n "{{target}}" ] && echo "--target {{target}}" || true)
@@ -42,6 +41,16 @@ synthesize: profile
 
 # Run the full pipeline end-to-end
 run: synthesize
+
+# ── Analyze (gemini → SQLite) ─────────────────────────────────────────────────
+
+# Stage 3 (Gemini): batch-analyse sessions → db/asaf.db (resumable)
+analyze:
+    python analyze.py
+
+# Dry-run: print prompts without calling gemini
+analyze-dry:
+    python analyze.py --dry-run
 
 # ── Inspect ───────────────────────────────────────────────────────────────────
 
