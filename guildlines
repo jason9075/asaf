@@ -1,0 +1,57 @@
+## 🛠 ASAF: Data Engineering & Session Guidelines
+
+### 1. Data Extraction (The "Raw to Refined" Layer)
+Extract only the essential signals from the Discord JSON to reduce token noise and cost.
+
+* **Identity Resolution:** * Map `author.id` to a consistent `display_name`. 
+    * Prioritize `nickname` > `global_name` > `username`.
+* **Content Sanitization:**
+    * **Strip Mentions:** Replace `<@!123456>` with `@Username` using a lookup table.
+    * **Media Tagging:** Replace image/video attachments with a placeholder like `[Sent an Image]` or `[Sent a Video]`. LLMs need to know the flow of conversation even if they can't see the file.
+    * **URL Handling:** Remove long URLs or replace them with `[URL: domain.com]` to keep the focus on the text.
+* **Temporal Normalization:** Convert all timestamps to a standard ISO 8601 format ($YYYY-MM-DD\ HH:mm:ss$) for easier interval calculation.
+
+---
+
+### 2. Sessionization Strategy (The "Context Window" Layer)
+Since "friendship" is built on distinct interactions, we split the continuous stream into **Sessions**.
+
+
+
+#### **Rule A: The "Silence" Threshold**
+* **Gap:** $\Delta t > 4\ hours$.
+* **Logic:** If no one speaks for 4 hours, the previous context has likely "cooled off." A new session starts.
+
+#### **Rule B: The "Burst" Limit**
+* **Max Messages:** 100 messages per session.
+* **Logic:** Even if a conversation lasts 8 hours (e.g., a gaming session), we force-split it at 100 messages to prevent "context drifting" and to fit into LLM prompt limits.
+
+#### **Rule C: The "Intertia" Factor**
+* If a session ends, but the first message of the *next* session is a direct reply (using Discord's reply feature) to the *last* session, consider merging them or adding a "Parent Context" pointer.
+
+---
+
+### 3. Personality Profiling Guidelines (The "LLM Analysis" Layer)
+When you batch a session to an LLM for "Personality Extraction," use these four pillars:
+
+| Pillar | Focus Area | Goal for ASAF |
+| :--- | :--- | :--- |
+| **Linguistic Style** | Slang, swearing, emoji density, sentence length. | Mimic the "voice." |
+| **Relational Role** | Is the friend a "listener," a "roaster," or an "advice-giver"? | Mimic the "dynamic." |
+| **Emotional Baseline** | Are they usually cynical, optimistic, or dry? | Mimic the "vibe." |
+| **Knowledge Graph** | Shared jokes, frequent topics (e.g., NixOS, Neovim). | Mimic the "memory." |
+
+---
+
+### 4. Project Roadmap (Architecture)
+
+1.  **`ingest.py`**: Clean the `gossip.json` into a sqlite/jsonl file of flat messages.
+2.  **`segment.py`**: Apply the 4-hour gap logic to group messages into `session_id`.
+3.  **`profile.py`**: Send each `session_id` to an LLM (e.g., GPT-4o or Claude 3.5) to generate a **Personality Fragment**.
+4.  **`synthesize.py`**: Aggregate all Fragments into a single **Master Personality Profile (The Agent's System Prompt)**.
+
+---
+
+### 💡 Recommendation for the "Session Slice"
+For the first pass, I recommend a **Sliding Window** if you have very long conversations. This ensures the LLM sees the end of one topic and the start of another, preventing "cutoff" confusion.
+
