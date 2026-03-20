@@ -21,6 +21,9 @@
           # Discord bot
           discordpy
 
+          # Web scraping
+          playwright
+
           # Data / DB
           # sqlite3 is built-in
 
@@ -41,11 +44,14 @@
             pkgs.just
             pkgs.sqlite
             pkgs.visidata
+            pkgs.playwright-driver.browsers
           ];
 
           shellHook = ''
             echo "ASAF dev shell ready (Python $(python --version))"
             [ -f .env ] && export $(grep -v '^#' .env | xargs) && echo ".env loaded"
+            export PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}
+            export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
           '';
         };
       });

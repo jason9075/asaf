@@ -15,6 +15,7 @@ from pathlib import Path
 
 import discord
 from dotenv import load_dotenv
+from playwright.async_api import async_playwright
 
 load_dotenv()
 
@@ -25,6 +26,11 @@ HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "30"))
 DB_PATH = Path(os.getenv("DB_PATH", "db/asaf.db"))
 MEMORY_SESSIONS = int(os.getenv("MEMORY_SESSIONS", "3"))   # max sessions to retrieve
 MEMORY_MSGS_PER_SESSION = int(os.getenv("MEMORY_MSGS_PER_SESSION", "5"))  # msgs per session
+
+URL_RE = re.compile(r"https?://[^\s<>\"]+")
+URL_FETCH_LIMIT = 2
+URL_CHAR_LIMIT = int(os.getenv("URL_CHAR_LIMIT", "2000"))
+URL_TIMEOUT_MS = 10_000
 
 # Common stop words to skip when building search keywords
 _STOP = {
@@ -99,6 +105,23 @@ def search_memory(context: str, db_path: Path) -> str:
     return "\n\n".join(snippets)
 
 
+async def fetch_url_content(url: str) -> str:
+    """Use Playwright to fetch page title + body text. Returns empty string on failure."""
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=URL_TIMEOUT_MS)
+            title = await page.title()
+            body = await page.evaluate("document.body.innerText")
+            await browser.close()
+        content = body.strip()[:URL_CHAR_LIMIT]
+        return f"Title: {title}\n{content}"
+    except Exception as e:
+        print(f"[bot] fetch failed {url}: {e}", flush=True)
+        return ""
+
+
 SILENT = "SILENT"
 
 
@@ -111,6 +134,7 @@ def call_gemini(
     memory: str = "",
     sender_label: str = "",
     sender_profile: str = "",
+    url_context: str = "",
 ) -> str:
     no_ack = (
         "IMPORTANT: Never start with acknowledgments like '收到', '了解', 'ready', "
@@ -144,11 +168,17 @@ def call_gemini(
         f"--- End of memory ---\n\n"
         if memory else ""
     )
+    url_block = (
+        f"--- Content from shared links ---\n{url_context}\n"
+        f"--- End of link content ---\n\n"
+        if url_context else ""
+    )
 
     prompt = (
         f"{system}\n\n"
         f"{sender_profile_block}"
         f"{memory_block}"
+        f"{url_block}"
         f"--- Recent conversation (last {HISTORY_LIMIT} messages) ---\n"
         f"{history}\n"
         f"--- End of history ---\n\n"
@@ -299,6 +329,21 @@ async def on_message(message: discord.Message) -> None:
 
     sender_profile = member_profiles.get(sender_id, "")
 
+    # Detect and fetch URLs in the message
+    urls = URL_RE.findall(user_msg)[:URL_FETCH_LIMIT]
+    url_context = ""
+    if urls:
+        fetch_results = await asyncio.gather(
+            *[fetch_url_content(u) for u in urls], return_exceptions=True
+        )
+        parts = []
+        for url, result in zip(urls, fetch_results):
+            if isinstance(result, str) and result:
+                parts.append(f"[URL: {url}]\n{result}")
+        if parts:
+            url_context = "\n\n".join(parts)
+            print(f"[bot] fetched {len(parts)} URL(s)", flush=True)
+
     if memory or sender_profile:
         print(
             f"[bot] context: sender_profile={'yes' if sender_profile else 'no'}, "
@@ -314,6 +359,7 @@ async def on_message(message: discord.Message) -> None:
                 profile_text, history, user_msg, GEMINI_MODEL,
                 must_reply=mentioned, memory=memory,
                 sender_label=sender_label, sender_profile=sender_profile,
+                url_context=url_context,
             ),
         )
 
