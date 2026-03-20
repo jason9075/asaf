@@ -18,6 +18,9 @@
           anthropic
           openai
 
+          # Discord bot
+          discordpy
+
           # Data / DB
           # sqlite3 is built-in
 

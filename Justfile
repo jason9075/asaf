@@ -34,9 +34,9 @@ profile: segment
 profile-dry:
     python profile.py --input {{segs}} --output {{frags}} --dry-run
 
-# Stage 4: synthesize fragments → master personality profile
-synthesize: profile
-    python synthesize.py --input {{frags}} --output {{profile}}
+# Stage 4: synthesize fragments → master personality profile (uses gemini via analyze)
+synthesize: analyze
+    python synthesize.py --output {{profile}}
     @echo "Profile written to {{profile}}"
 
 # Run the full pipeline end-to-end
@@ -58,6 +58,12 @@ analyze-dry:
 # Usage: just inspect 20
 inspect min="10":
     python inspect_sessions.py --min {{min}}
+
+# ── Bot ───────────────────────────────────────────────────────────────────────
+
+# Run Discord bot (WebSocket mode)
+bot:
+    python bot.py
 
 # ── Dev utilities ─────────────────────────────────────────────────────────────
 
