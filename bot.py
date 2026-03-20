@@ -28,6 +28,11 @@ DB_PATH = Path(os.getenv("DB_PATH", "db/asaf.db"))
 MEMORY_SESSIONS = int(os.getenv("MEMORY_SESSIONS", "3"))   # max sessions to retrieve
 MEMORY_MSGS_PER_SESSION = int(os.getenv("MEMORY_MSGS_PER_SESSION", "5"))  # msgs per session
 
+GOSSIP_CHANNEL_ID = os.getenv("GOSSIP_CHANNEL_ID", "860932792283168789")
+RECALL_LIMIT = int(os.getenv("RECALL_LIMIT", "3"))
+GEMINI_TOOL_MODEL = os.getenv("GEMINI_TOOL_MODEL", "")
+SKILLS_DIR = Path(os.getenv("SKILLS_DIR", "skills"))
+
 URL_RE = re.compile(r"https?://[^\s<>\"]+")
 URL_FETCH_LIMIT = 2
 URL_CHAR_LIMIT = int(os.getenv("URL_CHAR_LIMIT", "2000"))
@@ -104,6 +109,166 @@ def search_memory(context: str, db_path: Path) -> str:
         conn.close()
 
     return "\n\n".join(snippets)
+
+
+def search_sessions_for_recall(
+    query: str, db_path: Path, limit: int = RECALL_LIMIT
+) -> list[dict]:
+    """Search sessions for query keywords.
+
+    Returns list of {session_id, start, preview_msgs, jump_msg_id}.
+    preview_msgs: up to 4 messages that matched the keyword.
+    jump_msg_id: first message id in the session (for Discord jump link).
+    """
+    if not db_path.exists():
+        return []
+    words = [
+        w for w in re.findall(r"\w+", query)
+        if len(w) > 2 and w.lower() not in _STOP
+    ]
+    if not words:
+        return []
+
+    conn = sqlite3.connect(db_path)
+    seen: set[str] = set()
+    results: list[dict] = []
+    try:
+        for word in words[:8]:
+            if len(seen) >= limit:
+                break
+            rows = conn.execute(
+                "SELECT session_id, start, messages FROM sessions "
+                "WHERE messages LIKE ? ORDER BY start DESC LIMIT 5",
+                (f"%{word}%",),
+            ).fetchall()
+            for session_id, start, messages_json in rows:
+                if session_id in seen or len(seen) >= limit:
+                    continue
+                seen.add(session_id)
+                msgs: list[dict] = json.loads(messages_json)
+                hits = [
+                    m for m in msgs
+                    if word.lower() in m.get("content", "").lower()
+                ][:4]
+                if not hits:
+                    continue
+                jump_msg_id = msgs[0]["id"] if msgs else ""
+                results.append({
+                    "session_id": session_id,
+                    "start": start,
+                    "preview_msgs": hits,
+                    "jump_msg_id": jump_msg_id,
+                })
+    finally:
+        conn.close()
+    return results
+
+
+def format_recall_reply(
+    results: list[dict], guild_id: str, channel_id: str
+) -> str:
+    if not results:
+        return "找不到相關的過去對話 🤔"
+
+    lines = [f"找到 {len(results)} 段相關對話："]
+    for r in results:
+        date = r["start"][:10]
+        lines.append(f"\n📅 {date}")
+        for m in r["preview_msgs"]:
+            content = m["content"][:60] + ("…" if len(m["content"]) > 60 else "")
+            lines.append(f"  {m['display_name']}: {content}")
+        if r["jump_msg_id"] and guild_id and channel_id:
+            url = f"https://discord.com/channels/{guild_id}/{channel_id}/{r['jump_msg_id']}"
+            lines.append(f"  → {url}")
+    return "\n".join(lines)
+
+
+def load_skill_descriptors(skills_dir: Path) -> list[dict[str, str]]:
+    """Scan skills/*/SKILL.md and return [{name, description}] from frontmatter only.
+
+    Full skill content is intentionally NOT loaded here (deferred).
+    Only skills with bypasses_llm: true are surfaced to the tool router.
+    """
+    descriptors: list[dict[str, str]] = []
+    if not skills_dir.exists():
+        return descriptors
+    for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
+        text = skill_md.read_text(encoding="utf-8")
+        fm_match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+        if not fm_match:
+            continue
+        fm = fm_match.group(1)
+        name_m = re.search(r"^name:\s*(.+)$", fm, re.MULTILINE)
+        desc_m = re.search(r"^description:\s*(.+)$", fm, re.MULTILINE)
+        bypass_m = re.search(r"^\s*bypasses_llm:\s*(.+)$", fm, re.MULTILINE)
+        if not name_m or not desc_m:
+            continue
+        # Only expose skills that fully handle the request (bypasses_llm: true)
+        if bypass_m and bypass_m.group(1).strip().lower() != "true":
+            continue
+        descriptors.append({
+            "name": name_m.group(1).strip(),
+            "description": desc_m.group(1).strip(),
+        })
+    return descriptors
+
+
+def dispatch_tool_cli(
+    user_msg: str, guild_id: str, channel_id: str
+) -> str | None:
+    """Dynamically discover skills, call GEMINI_TOOL_MODEL to route, then execute.
+
+    Returns a formatted reply string if a skill was triggered, else None.
+    Falls back to None if GEMINI_TOOL_MODEL is unset, no skills found, or call fails.
+    """
+    if not GEMINI_TOOL_MODEL:
+        return None
+
+    descriptors = load_skill_descriptors(SKILLS_DIR)
+    if not descriptors:
+        return None
+
+    tool_lines = "\n".join(
+        f"- {d['name']}: {d['description']}" for d in descriptors
+    )
+    names = [d["name"] for d in descriptors]
+    example_name = names[0]
+    prompt = (
+        "You are a skill router for a Discord bot. "
+        "Decide if the user's message should trigger one of the available skills.\n\n"
+        f"Available skills:\n{tool_lines}\n\n"
+        f"User message: {user_msg}\n\n"
+        "If a skill should be triggered, output ONLY valid JSON:\n"
+        f'{{"tool": "{example_name}", "args": {{"query": "<extracted keywords>"}}}}\n\n'
+        "If no skill is needed, output ONLY:\n"
+        '{"tool": null}\n\n'
+        "Output raw JSON only. No explanation, no markdown code blocks."
+    )
+    cmd = ["gemini", "--model", GEMINI_TOOL_MODEL, "-p", prompt]
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd="/tmp")
+    if result.returncode != 0:
+        print(f"[bot] tool dispatch error: {result.stderr.strip()[:200]}", flush=True)
+        return None
+
+    raw = result.stdout.strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        print(f"[bot] tool dispatch: failed to parse JSON: {raw[:100]}", flush=True)
+        return None
+
+    tool_name = parsed.get("tool")
+    if tool_name not in names:
+        return None
+
+    if tool_name == "recall":
+        query = parsed.get("args", {}).get("query", user_msg)
+        results = search_sessions_for_recall(query, DB_PATH)
+        print(f"[bot] tool dispatch → recall: {len(results)} session(s) found", flush=True)
+        return format_recall_reply(results, guild_id, channel_id)
+
+    return None
 
 
 async def fetch_url_content(url: str) -> str:
@@ -450,6 +615,19 @@ async def on_message(message: discord.Message) -> None:
     if not user_msg:
         return
 
+    loop = asyncio.get_event_loop()
+
+    # Tool dispatch — LLM decides which skill to invoke (if any)
+    if mentioned:
+        channel_id_str = GOSSIP_CHANNEL_ID or str(message.channel.id)
+        guild_id_str = str(message.guild.id) if message.guild else ""
+        tool_reply = await loop.run_in_executor(
+            None, lambda: dispatch_tool_cli(user_msg, guild_id_str, channel_id_str)
+        )
+        if tool_reply is not None:
+            await message.channel.send(tool_reply)
+            return
+
     # Fetch last HISTORY_LIMIT messages (excluding the current one)
     history_lines: list[str] = []
     async for msg in message.channel.history(limit=HISTORY_LIMIT + 1, before=message):
@@ -458,8 +636,6 @@ async def on_message(message: discord.Message) -> None:
         history_lines.append(f"{author}: {content}")
     history_lines.reverse()  # chronological order
     history = "\n".join(history_lines) if history_lines else "(no prior messages)"
-
-    loop = asyncio.get_event_loop()
 
     # Resolve sender identity from member_map (stable across name changes)
     sender_id = str(message.author.id)
