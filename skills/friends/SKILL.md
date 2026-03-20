@@ -18,3 +18,9 @@ metadata:
 
 Use this when the message asks about or references a specific group member by name or alias.
 Examples: "你認識XX嗎", "你覺得XX怎麼樣", "XX是什麼人", "XX最近在幹嘛", "你跟XX熟嗎"
+
+## Stage 1 Prompt
+
+Which member IDs from the list above are referenced or asked about in this message?
+Output only the IDs, one per line.
+If no specific member is referenced, output exactly: NONE

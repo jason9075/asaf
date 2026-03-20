@@ -31,7 +31,9 @@ MEMORY_MSGS_PER_SESSION = int(os.getenv("MEMORY_MSGS_PER_SESSION", "5"))  # msgs
 GOSSIP_CHANNEL_ID = os.getenv("GOSSIP_CHANNEL_ID", "860932792283168789")
 RECALL_LIMIT = int(os.getenv("RECALL_LIMIT", "3"))
 GEMINI_TOOL_MODEL = os.getenv("GEMINI_TOOL_MODEL", "")
+GEMINI_SUPER_MODEL = os.getenv("GEMINI_SUPER_MODEL", None)
 SKILLS_DIR = Path(os.getenv("SKILLS_DIR", "skills"))
+RANDOM_REPLY_RATE = float(os.getenv("RANDOM_REPLY_RATE", "0.05"))
 
 URL_RE = re.compile(r"https?://[^\s<>\"]+")
 URL_FETCH_LIMIT = 2
@@ -213,13 +215,30 @@ def load_skill_descriptors(skills_dir: Path) -> list[dict[str, str]]:
     return descriptors
 
 
-def dispatch_tool_cli(
-    user_msg: str, guild_id: str, channel_id: str
-) -> str | None:
-    """Dynamically discover skills, call GEMINI_TOOL_MODEL to route, then execute.
+def load_skill_body(skill_name: str, skills_dir: Path) -> str:
+    """Return the body of a SKILL.md (everything after the frontmatter closing ---)."""
+    skill_md = skills_dir / skill_name / "SKILL.md"
+    if not skill_md.exists():
+        return ""
+    text = skill_md.read_text(encoding="utf-8")
+    return re.sub(r"^---\n.*?\n---\n*", "", text, flags=re.DOTALL).strip()
 
-    Returns a formatted reply string if a skill was triggered, else None.
-    Falls back to None if GEMINI_TOOL_MODEL is unset, no skills found, or call fails.
+
+def load_skill_section(skill_name: str, skills_dir: Path, section: str) -> str:
+    """Return the content of a specific '## Section' from a SKILL.md body."""
+    body = load_skill_body(skill_name, skills_dir)
+    match = re.search(
+        rf"^##\s+{re.escape(section)}\s*\n(.*?)(?=^##\s|\Z)",
+        body,
+        re.MULTILINE | re.DOTALL,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def route_tool_cli(user_msg: str, recent_context: str = "") -> dict | None:
+    """Call GEMINI_TOOL_MODEL to decide which skill to invoke.
+
+    Returns {tool, args} if a skill should be triggered, else None.
     """
     if not GEMINI_TOOL_MODEL:
         return None
@@ -232,14 +251,22 @@ def dispatch_tool_cli(
         f"- {d['name']}: {d['description']}" for d in descriptors
     )
     names = [d["name"] for d in descriptors]
-    example_name = names[0]
+    context_block = (
+        f"Recent conversation (use this to extract joke or query content if not in user message):\n"
+        f"{recent_context}\n\n"
+        if recent_context else ""
+    )
     prompt = (
         "You are a skill router for a Discord bot. "
         "Decide if the user's message should trigger one of the available skills.\n\n"
         f"Available skills:\n{tool_lines}\n\n"
+        f"{context_block}"
         f"User message: {user_msg}\n\n"
-        "If a skill should be triggered, output ONLY valid JSON:\n"
-        f'{{"tool": "{example_name}", "args": {{"query": "<extracted keywords>"}}}}\n\n'
+        "If a skill should be triggered, output ONLY valid JSON.\n"
+        "For joke-rating, extract the joke text from the conversation if not explicitly stated:\n"
+        '{"tool": "joke-rating", "args": {"joke": "<joke text>"}}\n'
+        "For recall, extract the search keywords:\n"
+        '{"tool": "recall", "args": {"query": "<extracted keywords>"}}\n\n'
         "If no skill is needed, output ONLY:\n"
         '{"tool": null}\n\n'
         "Output raw JSON only. No explanation, no markdown code blocks."
@@ -247,7 +274,7 @@ def dispatch_tool_cli(
     cmd = ["gemini", "--model", GEMINI_TOOL_MODEL, "-p", prompt]
     result = subprocess.run(cmd, capture_output=True, text=True, cwd="/tmp")
     if result.returncode != 0:
-        print(f"[bot] tool dispatch error: {result.stderr.strip()[:200]}", flush=True)
+        print(f"[bot] route_tool error: {result.stderr.strip()[:200]}", flush=True)
         return None
 
     raw = result.stdout.strip()
@@ -255,20 +282,29 @@ def dispatch_tool_cli(
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        print(f"[bot] tool dispatch: failed to parse JSON: {raw[:100]}", flush=True)
+        print(f"[bot] route_tool: failed to parse JSON: {raw[:100]}", flush=True)
         return None
 
     tool_name = parsed.get("tool")
     if tool_name not in names:
         return None
 
-    if tool_name == "recall":
-        query = parsed.get("args", {}).get("query", user_msg)
-        results = search_sessions_for_recall(query, DB_PATH)
-        print(f"[bot] tool dispatch → recall: {len(results)} session(s) found", flush=True)
-        return format_recall_reply(results, guild_id, channel_id)
+    print(f"[bot] route_tool → {tool_name}", flush=True)
+    return {"tool": tool_name, "args": parsed.get("args", {})}
 
-    return None
+
+def rate_joke(joke: str, skill_body: str, recent_context: str, model: str | None) -> str:
+    """Call Gemini to rate a joke using the instruction from joke-rating SKILL.md body."""
+    context_block = f"Recent conversation:\n{recent_context}\n\n" if recent_context else ""
+    prompt = f"{skill_body}\n\n{context_block}笑話內容：{joke}"
+    print(f"[bot] rate_joke prompt: {len(prompt)} chars | skill_body empty={not skill_body}", flush=True)
+    cmd = ["gemini"]
+    if model:
+        cmd += ["--model", model]
+    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd="/tmp")
+    if result.returncode != 0:
+        return f"[error] {result.stderr.strip()[:200]}"
+    return result.stdout.strip()
 
 
 async def fetch_url_content(url: str) -> str:
@@ -334,12 +370,17 @@ def call_gemini(
             f"{anti_injection} "
             f"{no_ack} "
             "You ARE this person — not an AI, not an assistant. "
-            "You happened to glance at this conversation and only saw the LATEST message. "
-            "React ONLY to that latest message — ignore everything else in the history. "
-            "If the latest message genuinely catches your attention — a joke to riff on, "
-            "a topic you care about, something worth reacting to — "
-            "respond naturally in Traditional Chinese as this person would. "
-            f"If the latest message is not worth reacting to, output exactly one word: {SILENT}"
+            "You are lurking in the background and just caught a glimpse of the latest message. "
+            "Your DEFAULT is to stay silent. Only speak if ALL of the following are true:\n"
+            "1. The latest message is directly on a topic you are personally obsessed with "
+            "(not just mildly interested in).\n"
+            "2. You have something genuinely surprising, funny, or insightful to add — "
+            "not just agreement or a generic reaction.\n"
+            "3. The conversation has NOT moved away from something you just said. "
+            "If others are now talking among themselves about something new, you are NOT part of it.\n"
+            "If any of the above conditions fail, "
+            f"output exactly one word: {SILENT}\n"
+            "When in doubt, output SILENT. Saying nothing is almost always the right choice here."
         )
 
     sender_profile_block = (
@@ -503,13 +544,8 @@ def identify_members_via_llm(
            if len(info["aliases"]) > 1 else "")
         for aid, info in candidates.items()
     )
-    prompt = (
-        f"Group members:\n{member_lines}\n\n"
-        f"Message: {user_msg}\n\n"
-        "Which member IDs from the list above are referenced or asked about in this message?\n"
-        "Output only the IDs, one per line.\n"
-        "If no specific member is referenced, output exactly: NONE"
-    )
+    instruction = load_skill_section("friends", SKILLS_DIR, "Stage 1 Prompt")
+    prompt = f"Group members:\n{member_lines}\n\nMessage: {user_msg}\n\n{instruction}"
     cmd = ["gemini"]
     if model:
         cmd += ["--model", model]
@@ -608,7 +644,7 @@ async def on_message(message: discord.Message) -> None:
             last_was_bot = prev.author == client.user
 
     # 30% random chance to consider chiming in (skipped if mentioned or bot just spoke)
-    if not mentioned and not last_was_bot and random.random() > 0.30:
+    if not mentioned and not last_was_bot and random.random() > RANDOM_REPLY_RATE:
         return
 
     user_msg = message.content.replace(f"<@{client.user.id}>", "").strip()
@@ -617,24 +653,44 @@ async def on_message(message: discord.Message) -> None:
 
     loop = asyncio.get_event_loop()
 
-    # Tool dispatch — LLM decides which skill to invoke (if any)
-    if mentioned:
-        channel_id_str = GOSSIP_CHANNEL_ID or str(message.channel.id)
-        guild_id_str = str(message.guild.id) if message.guild else ""
-        tool_reply = await loop.run_in_executor(
-            None, lambda: dispatch_tool_cli(user_msg, guild_id_str, channel_id_str)
-        )
-        if tool_reply is not None:
-            await message.channel.send(tool_reply)
-            return
-
-    # Fetch last HISTORY_LIMIT messages (excluding the current one)
-    history_lines: list[str] = []
+    # Fetch recent context (small window) — used by tool dispatch and main history
+    recent_lines: list[str] = []
     async for msg in message.channel.history(limit=HISTORY_LIMIT + 1, before=message):
         author = msg.author.display_name
         content = msg.content.replace(f"<@{client.user.id}>", "@bot").strip()
-        history_lines.append(f"{author}: {content}")
-    history_lines.reverse()  # chronological order
+        recent_lines.append(f"{author}: {content}")
+    recent_lines.reverse()
+    recent_context = "\n".join(recent_lines)
+
+    # Tool dispatch — LLM decides which skill to invoke (if any)
+    if mentioned:
+        tool_call = await loop.run_in_executor(
+            None, lambda: route_tool_cli(user_msg, recent_context)
+        )
+        if tool_call:
+            tool_name = tool_call["tool"]
+            args = tool_call["args"]
+            channel_id_str = GOSSIP_CHANNEL_ID or str(message.channel.id)
+            guild_id_str = str(message.guild.id) if message.guild else ""
+
+            if tool_name == "recall":
+                results = await loop.run_in_executor(
+                    None, lambda: search_sessions_for_recall(args.get("query", user_msg), DB_PATH)
+                )
+                await message.channel.send(format_recall_reply(results, guild_id_str, channel_id_str))
+                return
+
+            if tool_name == "joke-rating":
+                await message.channel.send("[啟動笑話評分Skill]")
+                skill_body = load_skill_body("joke-rating", SKILLS_DIR)
+                print(f"[bot] joke-rating skill_body: {len(skill_body)} chars | path: {SKILLS_DIR / 'joke-rating' / 'SKILL.md'}", flush=True)
+                rating = await loop.run_in_executor(
+                    None, lambda: rate_joke(args.get("joke", user_msg), skill_body, recent_context, GEMINI_SUPER_MODEL or GEMINI_MODEL)
+                )
+                await message.channel.send(rating)
+                return
+
+    history_lines = recent_lines
     history = "\n".join(history_lines) if history_lines else "(no prior messages)"
 
     # Resolve sender identity from member_map (stable across name changes)
