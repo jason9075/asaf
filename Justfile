@@ -59,6 +59,17 @@ analyze-dry:
 inspect min="10":
     python inspect_sessions.py --min {{min}}
 
+# ── Member profiles ───────────────────────────────────────────────────────────
+
+# Generate per-member personality profiles (data/members/<author_id>.md)
+profile-members min="50":
+    mkdir -p data/members
+    python profile_members.py --min-messages {{min}}
+
+# Dry-run: show who qualifies and preview first prompt
+profile-members-dry min="50":
+    python profile_members.py --min-messages {{min}} --dry-run
+
 # ── Bot ───────────────────────────────────────────────────────────────────────
 
 # Run Discord bot (WebSocket mode)
