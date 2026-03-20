@@ -11,6 +11,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import discord
@@ -177,6 +178,7 @@ def call_gemini(
         if url_context else ""
     )
 
+    sender_line = f"The person talking to you now: {sender_label}\n" if sender_label else ""
     prompt = (
         f"{system}\n\n"
         f"{sender_profile_block}"
@@ -185,10 +187,11 @@ def call_gemini(
         f"--- Recent conversation (last {HISTORY_LIMIT} messages) ---\n"
         f"{history}\n"
         f"--- End of history ---\n\n"
-        f"The person talking to you now: {sender_label}\n" if sender_label else ""
+        f"{sender_line}"
         f"Latest message: {user_msg}\n\n"
         f"{instruction}"
     )
+    print(f"[bot] prompt size: {len(prompt)} chars", flush=True)
     cmd = ["gemini"]
     if model:
         cmd += ["--model", model]
@@ -244,14 +247,22 @@ def get_member_history(author_id: str, db_path: Path) -> str:
     return "\n\n".join(snippets)
 
 
+_HOW_TO_INTERACT_RE = re.compile(r"\*\*How to interact.*", re.DOTALL | re.IGNORECASE)
+
+
 def load_member_profiles(members_dir: Path) -> dict[str, str]:
-    """Load all data/members/<author_id>.md → {author_id: profile_text}."""
+    """Load all data/members/<author_id>.md → {author_id: profile_text}.
+
+    Strips the 'How to interact' section — that's guidance for humans,
+    not a directive for the LLM to proactively bring up topics.
+    """
     profiles: dict[str, str] = {}
     if not members_dir.exists():
         return profiles
     for path in members_dir.glob("*.md"):
         author_id = path.stem
-        profiles[author_id] = path.read_text(encoding="utf-8").strip()
+        text = path.read_text(encoding="utf-8").strip()
+        profiles[author_id] = _HOW_TO_INTERACT_RE.sub("", text).strip()
     return profiles
 
 
@@ -311,16 +322,14 @@ async def on_message(message: discord.Message) -> None:
         if known_names else message.author.display_name
     )
 
-    # Fetch sender's historical messages from SQLite by author_id
-    sender_history = await loop.run_in_executor(
-        None, lambda: get_member_history(sender_id, DB_PATH)
-    )
-
-    # Search SQLite for topic-relevant memory
+    # Fetch sender history + topic memory in parallel
     search_context = f"{user_msg} {' '.join(history_lines[-5:])}"
-    topic_memory = await loop.run_in_executor(
-        None, lambda: search_memory(search_context, DB_PATH)
+    t0 = time.monotonic()
+    sender_history, topic_memory = await asyncio.gather(
+        loop.run_in_executor(None, lambda: get_member_history(sender_id, DB_PATH)),
+        loop.run_in_executor(None, lambda: search_memory(search_context, DB_PATH)),
     )
+    print(f"[bot] memory fetch: {time.monotonic() - t0:.1f}s", flush=True)
 
     # Compose memory block: sender identity + topic snippets
     memory_parts: list[str] = []
@@ -356,6 +365,7 @@ async def on_message(message: discord.Message) -> None:
         )
 
     async with message.channel.typing():
+        t1 = time.monotonic()
         reply = await loop.run_in_executor(
             None,
             lambda: call_gemini(
@@ -365,6 +375,7 @@ async def on_message(message: discord.Message) -> None:
                 url_context=url_context,
             ),
         )
+        print(f"[bot] gemini: {time.monotonic() - t1:.1f}s", flush=True)
 
     if reply == SILENT:
         print(f"[bot] chose to stay silent", flush=True)
