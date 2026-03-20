@@ -1,8 +1,10 @@
 """
 Discord bot: @mention → gemini (persona from profile.md) → reply
+30% chance to auto-chime in; LLM decides if there's a good opportunity.
 """
 import asyncio
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -24,14 +26,35 @@ def load_profile(path: Path) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
-def call_gemini(system: str, history: str, user_msg: str, model: str | None) -> str:
+SILENT = "SILENT"
+
+
+def call_gemini(
+    system: str,
+    history: str,
+    user_msg: str,
+    model: str | None,
+    must_reply: bool = False,
+) -> str:
+    if must_reply:
+        instruction = "Reply in the persona above."
+    else:
+        instruction = (
+            "You randomly decided to consider joining this conversation. "
+            "Read the recent messages and the latest message carefully. "
+            "If there is a natural opportunity to chime in — a punchline to land, "
+            "a topic you'd genuinely comment on, or a question you can answer in character — "
+            "reply in the persona above. "
+            f"Otherwise, output exactly one word: {SILENT}"
+        )
+
     prompt = (
         f"{system}\n\n"
-        f"--- Recent conversation ({HISTORY_LIMIT} messages) ---\n"
+        f"--- Recent conversation (last {HISTORY_LIMIT} messages) ---\n"
         f"{history}\n"
         f"--- End of history ---\n\n"
-        f"User: {user_msg}\n\n"
-        f"Reply in the persona above:"
+        f"Latest message: {user_msg}\n\n"
+        f"{instruction}"
     )
     cmd = ["gemini"]
     if model:
@@ -60,7 +83,10 @@ async def on_message(message: discord.Message) -> None:
     print(f"[debug] on_message: {message.author} → {message.content!r}", flush=True)
     if message.author == client.user:
         return
-    if client.user not in message.mentions:
+
+    mentioned = client.user in message.mentions
+    # 30% random chance to consider chiming in (skipped if already mentioned)
+    if not mentioned and random.random() > 0.30:
         return
 
     user_msg = message.content.replace(f"<@{client.user.id}>", "").strip()
@@ -79,8 +105,14 @@ async def on_message(message: discord.Message) -> None:
     async with message.channel.typing():
         loop = asyncio.get_event_loop()
         reply = await loop.run_in_executor(
-            None, lambda: call_gemini(profile_text, history, user_msg, GEMINI_MODEL)
+            None,
+            lambda: call_gemini(profile_text, history, user_msg, GEMINI_MODEL, must_reply=mentioned),
         )
+
+    if reply == SILENT:
+        print(f"[bot] chose to stay silent", flush=True)
+        return
+
     await message.channel.send(reply)
 
 
