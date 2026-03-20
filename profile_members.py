@@ -32,9 +32,16 @@ PROFILE_SYSTEM = textwrap.dedent("""\
     write a concise personality profile that a language model can use to understand
     and predict this person's behaviour.
 
-    Output format (plain text):
+    Output format (plain text, two sections):
+
+    Section 1 — YAML frontmatter (identity header for quick lookup):
     ---
-    [Display Name / Handle]
+    name: <primary display name>
+    aliases:
+      - <every name, nickname, or handle seen in the messages, one per line>
+    ---
+
+    Section 2 — Personality profile (full body, injected when this person is discussed):
 
     **Linguistic Style**
     <2-3 sentences: vocabulary, tone, emoji use, language mix, sentence length>
@@ -50,12 +57,13 @@ PROFILE_SYSTEM = textwrap.dedent("""\
 
     **How to interact with them**
     <2-3 sentences: what kind of responses they appreciate, what they react to, conversational dynamics>
-    ---
 
     Rules:
     - Only describe traits evidenced in the messages. Do not invent.
     - Write in English.
     - Be specific: quote or paraphrase 1-2 examples if helpful.
+    - In the aliases list, include ALL names, nicknames, and handles seen in the messages.
+    - Do NOT wrap the output in any outer --- delimiters beyond the YAML frontmatter block.
 """).strip()
 
 
