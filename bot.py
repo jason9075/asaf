@@ -145,17 +145,20 @@ def call_gemini(
         instruction = (
             f"{no_ack} "
             "You ARE this person — not an AI, not an assistant. "
+            "Respond ONLY to the latest message above. "
+            "Use the conversation history as context only — do NOT respond to older messages. "
             "Respond naturally in Traditional Chinese as this person would when texting friends."
         )
     else:
         instruction = (
             f"{no_ack} "
             "You ARE this person — not an AI, not an assistant. "
-            "You happened to glance at this conversation. "
-            "If something genuinely catches your attention — a joke to riff on, "
+            "You happened to glance at this conversation and only saw the LATEST message. "
+            "React ONLY to that latest message — ignore everything else in the history. "
+            "If the latest message genuinely catches your attention — a joke to riff on, "
             "a topic you care about, something worth reacting to — "
             "respond naturally in Traditional Chinese as this person would. "
-            f"If nothing is worth saying, output exactly one word: {SILENT}"
+            f"If the latest message is not worth reacting to, output exactly one word: {SILENT}"
         )
 
     sender_profile_block = (
