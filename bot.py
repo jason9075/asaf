@@ -354,10 +354,13 @@ async def on_message(message: discord.Message) -> None:
 
     mentioned = client.user in message.mentions
 
-    # Check if the bot's message was the last one (possible follow-up)
+    # Check if the bot's message was the last one (possible follow-up),
+    # but only if the message doesn't mention someone else — that means it's directed elsewhere.
+    mentions_others = any(u != client.user for u in message.mentions)
     last_was_bot = False
-    async for prev in message.channel.history(limit=1, before=message):
-        last_was_bot = prev.author == client.user
+    if not mentions_others:
+        async for prev in message.channel.history(limit=1, before=message):
+            last_was_bot = prev.author == client.user
 
     # 30% random chance to consider chiming in (skipped if mentioned or bot just spoke)
     if not mentioned and not last_was_bot and random.random() > 0.30:
