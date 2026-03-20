@@ -295,8 +295,14 @@ async def on_message(message: discord.Message) -> None:
         return
 
     mentioned = client.user in message.mentions
-    # 30% random chance to consider chiming in (skipped if already mentioned)
-    if not mentioned and random.random() > 0.30:
+
+    # Check if the bot's message was the last one (possible follow-up)
+    last_was_bot = False
+    async for prev in message.channel.history(limit=1, before=message):
+        last_was_bot = prev.author == client.user
+
+    # 30% random chance to consider chiming in (skipped if mentioned or bot just spoke)
+    if not mentioned and not last_was_bot and random.random() > 0.30:
         return
 
     user_msg = message.content.replace(f"<@{client.user.id}>", "").strip()
