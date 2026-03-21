@@ -76,6 +76,10 @@ profile-members-dry min="50":
 bot:
     python bot.py
 
+# Watch *.py and *.md for changes and auto-restart bot
+watch:
+    find . -name '*.py' -o -name '*.md' | grep -v __pycache__ | entr -r just bot
+
 # ── Dev utilities ─────────────────────────────────────────────────────────────
 
 # Type-check all Python files

@@ -42,6 +42,7 @@
           packages = [
             pythonEnv
             pkgs.just
+            pkgs.entr
             pkgs.sqlite
             pkgs.visidata
             pkgs.playwright-driver.browsers
