@@ -77,7 +77,7 @@ profile-members-dry min="50":
 
 # Run Discord bot (WebSocket mode)
 bot:
-    python {{bot}}/bot.py
+    python -m src.bot.bot
 
 # Watch *.py and *.md for changes and auto-restart bot
 watch:

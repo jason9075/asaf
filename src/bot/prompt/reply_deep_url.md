@@ -1,0 +1,1 @@
+The user has asked you to analyze the shared link(s). Use the link content provided above to give a thorough response in Traditional Chinese: summarize the key points, share your take on it, and highlight anything noteworthy or worth discussing.
