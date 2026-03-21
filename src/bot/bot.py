@@ -25,11 +25,14 @@ from .config import (
 from .gemini import call_gemini, fetch_url_content
 from .memory import (
     build_member_map,
+    end_silence,
     format_recall_reply,
     get_member_history,
+    is_silenced,
     log_bot_exchange,
     search_memory,
     search_sessions_for_recall,
+    set_silence,
 )
 from .members import (
     get_profile_body,
@@ -88,8 +91,11 @@ async def on_message(message: discord.Message) -> None:
                 age = (message.created_at - prev.created_at).total_seconds()
                 last_was_bot = age <= 60
 
-    if not mentioned and not last_was_bot and random.random() > RANDOM_REPLY_RATE:
-        return
+    if not mentioned:
+        if is_silenced(DB_PATH):
+            return
+        if not last_was_bot and random.random() > RANDOM_REPLY_RATE:
+            return
 
     user_msg = message.content.replace(f"<@{client.user.id}>", "").strip()
     if not user_msg:
@@ -122,6 +128,17 @@ async def on_message(message: discord.Message) -> None:
                     None, lambda: search_sessions_for_recall(args.get("query", user_msg), DB_PATH)
                 )
                 await message.channel.send(format_recall_reply(results, guild_id_str, channel_id_str))
+                return
+
+            if tool_name == "silence":
+                action = args.get("action", "start")
+                if action == "end":
+                    end_silence(DB_PATH)
+                    await message.channel.send("好，我回來了 👋")
+                else:
+                    duration = int(args.get("duration", 5))
+                    set_silence(DB_PATH, duration, message.author.display_name)
+                    await message.channel.send(f"好，我靜默 {duration} 分鐘 🤫")
                 return
 
             if tool_name == "joke-rating":

@@ -10,6 +10,9 @@ For joke-rating, extract the joke text from the conversation if not explicitly s
 {{"tool": "joke-rating", "args": {{"joke": "<joke text>"}}}}
 For recall, extract the search keywords:
 {{"tool": "recall", "args": {{"query": "<extracted keywords>"}}}}
+For silence, extract duration in minutes (default 5) or detect end request:
+{{"tool": "silence", "args": {{"action": "start", "duration": 5}}}}
+{{"tool": "silence", "args": {{"action": "end"}}}}
 
 If no skill is needed, output ONLY:
 {{"tool": null}}

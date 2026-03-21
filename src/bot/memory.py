@@ -172,6 +172,74 @@ def get_member_history(author_id: str, db_path: Path) -> str:
     return "\n\n".join(snippets)
 
 
+def set_silence(db_path: Path, duration_minutes: int, requested_by: str) -> None:
+    """Insert a silence record. Any existing active silence is overwritten."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS silence_log (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                start        TEXT NOT NULL,
+                end          TEXT NOT NULL,
+                requested_by TEXT NOT NULL
+            )
+        """)
+        now = datetime.now()
+        end = datetime(now.year, now.month, now.day, now.hour, now.minute, now.second)
+        from datetime import timedelta
+        end = now + timedelta(minutes=duration_minutes)
+        conn.execute(
+            "INSERT INTO silence_log (start, end, requested_by) VALUES (?, ?, ?)",
+            (now.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"), requested_by),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def end_silence(db_path: Path) -> None:
+    """Expire all active silence records immediately."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS silence_log (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                start        TEXT NOT NULL,
+                end          TEXT NOT NULL,
+                requested_by TEXT NOT NULL
+            )
+        """)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute("UPDATE silence_log SET end = ? WHERE end > ?", (now, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def is_silenced(db_path: Path) -> bool:
+    """Return True if there is an active silence record right now."""
+    if not db_path.exists():
+        return False
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS silence_log (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                start        TEXT NOT NULL,
+                end          TEXT NOT NULL,
+                requested_by TEXT NOT NULL
+            )
+        """)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        row = conn.execute(
+            "SELECT 1 FROM silence_log WHERE start <= ? AND end > ? LIMIT 1",
+            (now, now),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def log_bot_exchange(
     db_path: Path,
     channel_id: str,
