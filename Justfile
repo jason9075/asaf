@@ -10,6 +10,9 @@ frags   := "data/fragments.jsonl"
 profile := "data/profile.md"
 target  := ""
 
+pipeline := "src/pipeline"
+bot      := "src/bot"
+
 # List all available targets
 default:
     @just --list
@@ -19,24 +22,24 @@ default:
 # Stage 1: ingest raw Discord JSON → cleaned JSONL
 ingest:
     mkdir -p data
-    python ingest.py --input {{input}} --output {{jsonl}}
+    python {{pipeline}}/ingest.py --input {{input}} --output {{jsonl}}
 
 # Stage 2: group messages into sessions
 segment: ingest
-    python segment.py --input {{jsonl}} --output {{segs}}
+    python {{pipeline}}/segment.py --input {{jsonl}} --output {{segs}}
 
 # Stage 3 (Claude): extract personality fragments — just profile target=<author_id>
 profile: segment
-    python profile.py --input {{segs}} --output {{frags}} \
+    python {{pipeline}}/profile.py --input {{segs}} --output {{frags}} \
         $([ -n "{{target}}" ] && echo "--target {{target}}" || true)
 
 # Dry-run: print prompts without calling API
 profile-dry:
-    python profile.py --input {{segs}} --output {{frags}} --dry-run
+    python {{pipeline}}/profile.py --input {{segs}} --output {{frags}} --dry-run
 
 # Stage 4: synthesize fragments → master personality profile (uses gemini via analyze)
 synthesize: analyze
-    python synthesize.py --output {{profile}}
+    python {{pipeline}}/synthesize.py --output {{profile}}
     @echo "Profile written to {{profile}}"
 
 # Run the full pipeline end-to-end
@@ -46,49 +49,49 @@ run: synthesize
 
 # Stage 3 (Gemini): batch-analyse sessions → db/asaf.db (resumable)
 analyze:
-    python analyze.py
+    python {{pipeline}}/analyze.py
 
 # Dry-run: print prompts without calling gemini
 analyze-dry:
-    python analyze.py --dry-run
+    python {{pipeline}}/analyze.py --dry-run
 
 # ── Inspect ───────────────────────────────────────────────────────────────────
 
 # Show sessions with message_count > MIN (default 10)
 # Usage: just inspect 20
 inspect min="10":
-    python inspect_sessions.py --min {{min}}
+    python {{pipeline}}/inspect_sessions.py --min {{min}}
 
 # ── Member profiles ───────────────────────────────────────────────────────────
 
 # Generate per-member personality profiles (data/members/<author_id>.md)
 profile-members min="50":
     mkdir -p data/members
-    python profile_members.py --min-messages {{min}}
+    python {{pipeline}}/profile_members.py --min-messages {{min}}
 
 # Dry-run: show who qualifies and preview first prompt
 profile-members-dry min="50":
-    python profile_members.py --min-messages {{min}} --dry-run
+    python {{pipeline}}/profile_members.py --min-messages {{min}} --dry-run
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
 
 # Run Discord bot (WebSocket mode)
 bot:
-    python bot.py
+    python {{bot}}/bot.py
 
 # Watch *.py and *.md for changes and auto-restart bot
 watch:
-    find . -name '*.py' -o -name '*.md' | grep -v __pycache__ | entr -r just bot
+    find src .gemini -name '*.py' -o -name '*.md' | grep -v __pycache__ | entr -r just bot
 
 # ── Dev utilities ─────────────────────────────────────────────────────────────
 
 # Type-check all Python files
 typecheck:
-    mypy *.py --strict
+    mypy src/ --strict
 
 # Lint and auto-fix
 lint:
-    ruff check . --fix
+    ruff check src/ --fix
 
 # Inspect raw segments
 segments:
