@@ -1,16 +1,16 @@
 """
 Stage 3: profile.py
-Sends each session to Claude → Personality Fragment (JSONL).
+Sends each session to Claude → Knowledge Graph Fragment (SQLite).
 
-Each fragment covers four pillars:
-  - linguistic_style   : slang, emoji density, sentence length, tone
-  - relational_role    : listener / roaster / advice-giver / hype-man …
-  - emotional_baseline : cynical / optimistic / dry / anxious …
-  - knowledge_graph    : recurring topics, shared jokes, niche interests
+Each fragment is structured for a SQLite-backed memory/RAG system:
+  - session_metadata   : primary topic, confidence score, urgency level
+  - participants       : user roles and contribution weights
+  - discussion_outline : timestamped sections with summaries and resolution status
+  - indexing_metadata  : technologies, entities, error signatures, concepts, action items
 
 Usage:
-  python profile.py [--input data/sessions.jsonl] [--output data/fragments.jsonl]
-                    [--target <author_id>] [--min-messages 3]
+  python profile.py [--input data/sessions.jsonl] [--db db/asaf.db]
+                    [--target <author_id>] [--min-messages 10]
                     [--concurrency 4] [--dry-run]
 """
 
@@ -19,107 +19,162 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
+import sqlite3
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import anthropic
-
 # ── Config ───────────────────────────────────────────────────────────────────
 
-MODEL = "claude-haiku-4-5-20251001"
-MAX_TOKENS = 1024
-MIN_MESSAGES_DEFAULT = 3
+MIN_MESSAGES_DEFAULT = 10
 
 SYSTEM_PROMPT = """\
-You are a personality analyst. Given a Discord chat session transcript, extract a \
-structured personality fragment for the specified target user.
+Role: You are a Contextual Data Engineer specializing in dialogue decomposition and \
+knowledge graph extraction.
 
-Return ONLY a valid JSON object with exactly these keys:
+Task: Analyze the provided Discord chat transcript. Transform raw conversation into a \
+structured JSON object optimized for storage in a SQLite-backed memory system.
+
+Output Requirements:
+Return ONLY a valid JSON object. If the session contains fewer than 2 meaningful messages, \
+return null.
+
+JSON Schema:
 {
-  "linguistic_style": "...",
-  "relational_role": "...",
-  "emotional_baseline": "...",
-  "knowledge_graph": ["topic1", "topic2", ...]
+  "session_metadata": {
+    "primary_topic": "Short, descriptive title of the main discussion",
+    "confidence_score": 0.0,
+    "urgency_level": "low/medium/high"
+  },
+  "participants": [
+    {
+      "user_id": "Discord numeric author_id (e.g., 123456789012345678)",
+      "role": "e.g., Questioner, Expert, Facilitator, Casual Observer",
+      "contribution_weight": 0.0
+    }
+  ],
+  "discussion_outline": [
+    {
+      "timestamp_range": "e.g., 10:00 - 10:15",
+      "section_title": "...",
+      "summary": "Concise technical summary",
+      "resolved": true
+    }
+  ],
+  "indexing_metadata": {
+    "technologies": ["Specific tools, languages, or frameworks"],
+    "entities": ["Projects, organizations, or specific hardware models"],
+    "error_signatures": ["Specific error codes or log patterns mentioned"],
+    "concepts": ["High-level architectural patterns or methodologies"],
+    "action_items": ["Tasks or next steps explicitly agreed upon"]
+  }
 }
 
-Guidelines:
-- linguistic_style: describe vocabulary, sentence length, use of slang/emoji/profanity, \
-  typing habits (e.g. "short bursts, heavy emoji, mix of English and Traditional Chinese, \
-  occasional swearing").
-- relational_role: how this person functions in group chat dynamics (e.g. "primary topic \
-  initiator, often roasts others, de-escalates tension with humor").
-- emotional_baseline: underlying emotional tone and temperament (e.g. "dry and sarcastic, \
-  occasional bursts of genuine enthusiasm, low-key cynical").
-- knowledge_graph: list of 3–8 topics, interests, or recurring references shown in this session.
-
-If the target user has fewer than 2 messages in this session, return null.\
+Extraction Guidelines:
+1. Indexing Priority: In indexing_metadata, prioritize high-entropy technical terms \
+(e.g., NixOS, LSP, FTS5) over generic words (e.g., code, problem).
+2. Entity Normalization: Standardize naming (e.g., convert "nvim" to "Neovim").
+3. Noise Reduction: Ignore bot commands, social pleasantries (e.g., "Good morning"), \
+and stickers unless they convey a decision.
+4. SQLite Optimization: Ensure indexing_metadata arrays are clean and unique, as these \
+will be used for Full-Text Search (FTS) and relational mapping.
+5. Context Switching: If the participants jump between unrelated topics, create distinct \
+entries in the discussion_outline.\
 """
 
 
-def format_transcript(session: dict[str, Any], target_display: str | None) -> str:
+def format_transcript(session: dict[str, Any], target_display: str | None = None) -> str:
     """Format session messages as a readable transcript."""
     lines: list[str] = [
         f"Session {session['session_id']} | {session['start']} → {session['end']}",
         f"Messages: {session['message_count']}",
+        "---",
     ]
-    if target_display:
-        lines.append(f"Target user: {target_display}")
-    lines.append("---")
     for msg in session["messages"]:
-        lines.append(f"[{msg['timestamp']}] {msg['display_name']}: {msg['content']}")
+        lines.append(f"[{msg['timestamp']}] {msg['display_name']} ({msg['author_id']}): {msg['content']}")
     return "\n".join(lines)
 
 
-def build_user_prompt(session: dict[str, Any], target_display: str | None) -> str:
-    transcript = format_transcript(session, target_display)
-    if target_display:
-        return (
-            f"Analyze the personality of **{target_display}** based on the session below.\n\n"
-            f"{transcript}"
-        )
-    return f"Analyze the personality of ALL participants in the session below.\n\n{transcript}"
+def build_prompt(session: dict[str, Any]) -> str:
+    transcript = format_transcript(session)
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"Analyze the following Discord session and return the structured JSON.\n\n"
+        f"{transcript}"
+    )
 
 
-# ── API call ─────────────────────────────────────────────────────────────────
+# ── Gemini call ───────────────────────────────────────────────────────────────
+
+def call_gemini(prompt: str, model: str | None) -> tuple[str, bool]:
+    """Pipe prompt to gemini CLI via stdin. Returns (stdout, success)."""
+    cmd = ["gemini"]
+    if model:
+        cmd += ["--model", model]
+    result = subprocess.run(cmd, input=prompt, capture_output=True, text=True)
+    if result.returncode != 0:
+        return result.stderr.strip(), False
+    return result.stdout.strip(), True
+
+
+def parse_fragment(raw: str) -> dict[str, Any] | None:
+    """Extract and parse JSON from LLM response. Returns None on failure."""
+    text = raw.strip()
+
+    # Strip markdown fences if present
+    if "```" in text:
+        parts = text.split("```")
+        # parts[1] is the fenced block content
+        if len(parts) >= 3:
+            text = parts[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+
+    # Try direct parse first
+    try:
+        data = json.loads(text)
+        return data if data is not None else None
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: extract outermost { ... } block
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            data = json.loads(text[start : end + 1])
+            return data if data is not None else None
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
 
 async def extract_fragment(
-    client: anthropic.AsyncAnthropic,
     session: dict[str, Any],
-    target_id: str | None,
-    target_display: str | None,
+    model: str | None,
     semaphore: asyncio.Semaphore,
 ) -> dict[str, Any] | None:
-    """Call Claude and return a fragment dict, or None on failure."""
+    """Call gemini and return a fragment dict, or None on failure."""
     async with semaphore:
-        user_prompt = build_user_prompt(session, target_display)
-        try:
-            response = await client.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            raw = response.content[0].text.strip()
-            # Strip markdown code fences if present
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-            fragment_data = json.loads(raw)
-            if fragment_data is None:
-                return None
-        except (json.JSONDecodeError, IndexError, anthropic.APIError) as e:
-            print(f"  [warn] {session['session_id']}: {e}", file=sys.stderr)
+        prompt = build_prompt(session)
+        raw, success = await asyncio.to_thread(call_gemini, prompt, model)
+        if not success:
+            print(f"  [warn] {session['session_id']}: gemini error: {raw[:80]}", file=sys.stderr)
+            return None
+        fragment_data = parse_fragment(raw)
+        if fragment_data is None:
+            preview = raw[:120].replace("\n", " ")
+            print(f"  [warn] {session['session_id']}: JSON parse failed | {preview}", file=sys.stderr)
             return None
 
     return {
         "session_id": session["session_id"],
         "start": session["start"],
         "end": session["end"],
-        "target_id": target_id,
-        "target_display": target_display,
         **fragment_data,
     }
 
@@ -136,20 +191,54 @@ def load_sessions(path: Path) -> list[dict[str, Any]]:
     return sessions
 
 
-def load_done_ids(path: Path) -> set[str]:
-    """Return set of session_ids already in output file (for resume)."""
-    done: set[str] = set()
-    if not path.exists():
-        return done
-    with path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    done.add(json.loads(line)["session_id"])
-                except (json.JSONDecodeError, KeyError):
-                    pass
-    return done
+_DDL = """\
+CREATE TABLE IF NOT EXISTS profile_fragments (
+    session_id         TEXT PRIMARY KEY,
+    start              TEXT NOT NULL,
+    end                TEXT NOT NULL,
+    session_metadata   TEXT NOT NULL,
+    participants       TEXT NOT NULL,
+    discussion_outline TEXT NOT NULL,
+    indexing_metadata  TEXT NOT NULL,
+    created_at         TEXT NOT NULL
+);
+"""
+
+
+def init_db(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute(_DDL)
+    conn.commit()
+    return conn
+
+
+def load_done_ids(conn: sqlite3.Connection) -> set[str]:
+    """Return set of session_ids already stored in profile_fragments."""
+    rows = conn.execute("SELECT session_id FROM profile_fragments").fetchall()
+    return {r[0] for r in rows}
+
+
+def save_fragment(conn: sqlite3.Connection, fragment: dict[str, Any]) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO profile_fragments
+            (session_id, start, end, session_metadata, participants,
+             discussion_outline, indexing_metadata, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            fragment["session_id"],
+            fragment["start"],
+            fragment["end"],
+            json.dumps(fragment.get("session_metadata", {}), ensure_ascii=False),
+            json.dumps(fragment.get("participants", []), ensure_ascii=False),
+            json.dumps(fragment.get("discussion_outline", []), ensure_ascii=False),
+            json.dumps(fragment.get("indexing_metadata", {}), ensure_ascii=False),
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        ),
+    )
+    conn.commit()
 
 
 def filter_sessions(
@@ -172,27 +261,18 @@ def filter_sessions(
 
 async def run(
     input_path: Path,
-    output_path: Path,
+    db_path: Path,
     target_id: str | None,
     min_messages: int,
     concurrency: int,
+    model: str | None,
     dry_run: bool,
 ) -> None:
     sessions = load_sessions(input_path)
     sessions = filter_sessions(sessions, target_id, min_messages)
-    done_ids = load_done_ids(output_path)
 
-    # Build target display name from first matching message
-    target_display: str | None = None
-    if target_id:
-        for s in sessions:
-            for m in s["messages"]:
-                if m["author_id"] == target_id:
-                    target_display = m["display_name"]
-                    break
-            if target_display:
-                break
-
+    conn = init_db(db_path)
+    done_ids = load_done_ids(conn)
     pending = [s for s in sessions if s["session_id"] not in done_ids]
 
     print(
@@ -203,30 +283,22 @@ async def run(
     )
 
     if dry_run:
+        conn.close()
         sample = pending[:3] if pending else sessions[:3]
         for s in sample:
             print(f"\n--- {s['session_id']} ---", file=sys.stderr)
-            print(build_user_prompt(s, target_display), file=sys.stderr)
+            print(build_prompt(s), file=sys.stderr)
         return
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("[error] ANTHROPIC_API_KEY not set", file=sys.stderr)
-        sys.exit(1)
-
-    client = anthropic.AsyncAnthropic(api_key=api_key)
     semaphore = asyncio.Semaphore(concurrency)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
     completed = 0
     errors = 0
 
-    async def process(session: dict[str, Any], fout: Any) -> None:
+    async def process(session: dict[str, Any]) -> None:
         nonlocal completed, errors
-        fragment = await extract_fragment(client, session, target_id, target_display, semaphore)
+        fragment = await extract_fragment(session, model, semaphore)
         if fragment:
-            fout.write(json.dumps(fragment, ensure_ascii=False) + "\n")
-            fout.flush()
+            save_fragment(conn, fragment)
             completed += 1
         else:
             errors += 1
@@ -237,37 +309,40 @@ async def run(
                 file=sys.stderr,
             )
 
-    with output_path.open("a", encoding="utf-8") as fout:
-        tasks = [process(s, fout) for s in pending]
-        await asyncio.gather(*tasks)
+    tasks = [process(s) for s in pending]
+    await asyncio.gather(*tasks)
+    conn.close()
 
     print(
-        f"[profile] finished: {completed} fragments, {errors} errors → {output_path}",
+        f"[profile] finished: {completed} fragments, {errors} errors → {db_path}",
         file=sys.stderr,
     )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Profile sessions via LLM → fragments JSONL")
+    parser = argparse.ArgumentParser(description="Profile sessions via LLM → SQLite fragments")
     parser.add_argument("--input", default="data/sessions.jsonl", type=Path)
-    parser.add_argument("--output", default="data/fragments.jsonl", type=Path)
+    parser.add_argument("--db", default="db/asaf.db", type=Path)
     parser.add_argument(
         "--target",
         default=None,
         help="Filter to sessions containing this author_id",
     )
-    parser.add_argument("--min-messages", default=MIN_MESSAGES_DEFAULT, type=int)
-    parser.add_argument("--concurrency", default=4, type=int, help="Parallel API calls")
-    parser.add_argument("--dry-run", action="store_true", help="Print prompts, skip API calls")
+    parser.add_argument("--min-messages", default=MIN_MESSAGES_DEFAULT, type=int,
+                        help=f"Min messages per session (default: {MIN_MESSAGES_DEFAULT})")
+    parser.add_argument("--concurrency", default=4, type=int, help="Parallel gemini calls")
+    parser.add_argument("--model", default=None, help="Gemini model name (optional)")
+    parser.add_argument("--dry-run", action="store_true", help="Print prompts, skip gemini call")
     args = parser.parse_args()
 
     asyncio.run(
         run(
             input_path=args.input,
-            output_path=args.output,
+            db_path=args.db,
             target_id=args.target,
             min_messages=args.min_messages,
             concurrency=args.concurrency,
+            model=args.model,
             dry_run=args.dry_run,
         )
     )

@@ -6,9 +6,9 @@ set dotenv-load := true
 input   := "raw_json/gossip.json"
 jsonl   := "data/messages.jsonl"
 segs    := "data/sessions.jsonl"
-frags   := "data/fragments.jsonl"
 profile := "data/profile.md"
 target  := ""
+model   := ""
 
 pipeline := "src/pipeline"
 bot      := "src/bot"
@@ -30,12 +30,13 @@ segment: ingest
 
 # Stage 3 (Claude): extract personality fragments — just profile target=<author_id>
 profile: segment
-    python {{pipeline}}/profile.py --input {{segs}} --output {{frags}} \
-        $([ -n "{{target}}" ] && echo "--target {{target}}" || true)
+    python {{pipeline}}/profile.py --input {{segs}} --db db/asaf.db \
+        $([ -n "{{target}}" ] && echo "--target {{target}}" || true) \
+        $([ -n "{{model}}" ] && echo "--model {{model}}" || true)
 
 # Dry-run: print prompts without calling API
 profile-dry:
-    python {{pipeline}}/profile.py --input {{segs}} --output {{frags}} --dry-run
+    python {{pipeline}}/profile.py --input {{segs}} --db db/asaf.db --dry-run
 
 # Stage 4: synthesize fragments → master personality profile (uses gemini via analyze)
 synthesize: analyze
@@ -107,5 +108,6 @@ clean:
 status:
     @echo "=== messages (JSONL) ===" && wc -l < {{jsonl}} 2>/dev/null || echo "not generated"
     @echo "=== segments ===" && wc -l < {{segs}} 2>/dev/null || echo "not generated"
-    @echo "=== fragments ===" && wc -l < {{frags}} 2>/dev/null || echo "not generated"
+    @echo "=== profile_fragments (SQLite) ===" && \
+        sqlite3 db/asaf.db "SELECT COUNT(*) FROM profile_fragments;" 2>/dev/null || echo "not generated"
     @echo "=== profile ===" && [ -f {{profile}} ] && echo "exists" || echo "not generated"
