@@ -44,6 +44,7 @@
             pkgs.just
             pkgs.entr
             pkgs.sqlite
+            pkgs.plantuml
             pkgs.visidata
             pkgs.playwright-driver.browsers
           ];

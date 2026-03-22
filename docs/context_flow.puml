@@ -1,0 +1,97 @@
+@startuml context_flow
+title Bot Context Assembly Flow (on_message → Gemini)
+
+skinparam backgroundColor #FAFAFA
+skinparam sequence {
+  ArrowColor #444
+  LifeLineBorderColor #888
+  ParticipantBorderColor #555
+  ParticipantBackgroundColor #EEF
+  NoteBackgroundColor #FFFDE7
+  NoteBorderColor #F9A825
+}
+
+participant "Discord\non_message" as DC
+participant "bot.py" as BOT
+participant "memory.py\n(SQLite)" as MEM
+participant "members.py" as MEMB
+participant "gemini.py\ncall_gemini()" as GEM
+participant "prompt/*.md" as PROMPTS
+database ".gemini/\nsystem.md" as SYS
+database "data/members/\n<id>.md" as MFILES
+database "skills/*/\nSKILL.md" as SKILL
+
+== 1. Gate checks (早期 return) ==
+DC -> BOT : on_message(message)
+BOT -> BOT : is self? → return
+BOT -> BOT : mentioned?
+BOT -> MEM : is_silenced(DB_PATH)
+note right: 非 mention 且靜默中 → return
+BOT -> BOT : last_was_bot? (60s 內)\nrandom rate? → return
+
+== 2. Tool dispatch (僅 @mention) ==
+BOT -> BOT : fetch recent_lines (history)
+BOT -> SKILL : load_skill_descriptors()
+note right: skills/*/SKILL.md\nbypasses_llm: true
+BOT -> BOT : route_tool_cli(user_msg)\n→ gemini 判斷 tool_router.md
+alt tool = recall
+  BOT -> MEM : search_sessions_for_recall()
+  BOT -> DC : send results
+  BOT --> DC : return
+else tool = silence
+  BOT -> MEM : set_silence() / end_silence()
+  BOT --> DC : return
+else tool = joke-rating
+  BOT -> SKILL : load_skill_body("joke-rating")
+  BOT --> DC : return
+end
+
+== 3. Context assembly ==
+BOT -> MEM : get_member_history(sender_id)\n+ search_memory(topic)
+note right : [Past messages]\n[Topic-related sessions]
+
+BOT -> MFILES : member_profiles.get(sender_id)
+note right : sender_profile\n= data/members/<id>.md
+
+BOT -> MEMB : identify_members_via_llm(user_msg)
+BOT -> MFILES : load matched member .md files
+note right : group_context\n= 被提及成員的 profile
+
+BOT -> BOT : URL_RE.findall(user_msg)\n(or scan history if none)
+alt URLs found
+  BOT -> BOT : fetch_url_content() via Playwright
+  note right : url_context
+end
+
+== 4. Prompt assembly (gemini.py) ==
+BOT -> GEM : call_gemini(\n  history, user_msg,\n  memory, sender_profile,\n  group_context, url_context,\n  must_reply, deep_url\n)
+
+GEM -> PROMPTS : _load_prompt("anti_injection")
+GEM -> PROMPTS : _load_prompt("no_ack")
+alt deep_url
+  GEM -> PROMPTS : _load_prompt("reply_deep_url")
+else must_reply
+  GEM -> PROMPTS : _load_prompt("reply_must")
+else casual
+  GEM -> PROMPTS : _load_prompt("reply_casual")
+end
+
+note over GEM
+  **stdin prompt 組裝順序：**
+  1. sender_profile_block   ← data/members/<id>.md
+  2. memory_block           ← SQLite sessions
+  3. group_block            ← 被提及成員 .md
+  4. url_block              ← Playwright 抓取內容
+  5. history block          ← 最近 30 則對話
+  6. Latest message
+  7. instruction            ← prompt/*.md 組合
+end note
+
+GEM -> SYS : env GEMINI_SYSTEM_MD=<path>
+note right : gemini CLI 自動載入\n.gemini/system.md\n作為 system instruction
+
+GEM -> BOT : reply string
+BOT -> DC : message.channel.send(reply)
+BOT -> MEM : log_bot_exchange()
+
+@enduml
