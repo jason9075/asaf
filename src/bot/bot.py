@@ -104,9 +104,17 @@ async def on_message(message: discord.Message) -> None:
     loop = asyncio.get_event_loop()
 
     # Fetch recent context
+    # Prefer guild member's server nickname over the User global name
+    def _display(author: discord.User | discord.Member) -> str:
+        if message.guild:
+            member = message.guild.get_member(author.id)
+            if member:
+                return member.display_name
+        return author.display_name
+
     recent_lines: list[str] = []
     async for msg in message.channel.history(limit=HISTORY_LIMIT + 1, before=message):
-        author = msg.author.display_name
+        author = _display(msg.author)
         content = msg.content.replace(f"<@{client.user.id}>", "@bot").strip()
         recent_lines.append(f"{author}: {content}")
     recent_lines.reverse()
