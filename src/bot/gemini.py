@@ -102,5 +102,5 @@ def call_gemini(
     env = {**os.environ, "GEMINI_SYSTEM_MD": GEMINI_SYSTEM_MD_PATH}
     result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd="/tmp", env=env)
     if result.returncode != 0:
-        return f"[error] {result.stderr.strip()[:200]}"
-    return result.stdout.strip()
+        return f"[error] {result.stderr.strip()[:200]}", prompt
+    return result.stdout.strip(), prompt

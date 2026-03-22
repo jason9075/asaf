@@ -247,6 +247,7 @@ def log_bot_exchange(
     user_msg: str,
     reply: str,
     model: str | None,
+    input_prompt: str = "",
 ) -> None:
     """Append one bot exchange to bot_logs, creating the table if needed."""
     conn = sqlite3.connect(db_path)
@@ -259,20 +260,22 @@ def log_bot_exchange(
                 sender_id    TEXT NOT NULL,
                 sender_label TEXT NOT NULL,
                 user_msg     TEXT NOT NULL,
+                input_prompt TEXT NOT NULL,
                 reply        TEXT NOT NULL,
                 model        TEXT
             )
         """)
         conn.execute(
             "INSERT INTO bot_logs "
-            "(timestamp, channel_id, sender_id, sender_label, user_msg, reply, model) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(timestamp, channel_id, sender_id, sender_label, user_msg, input_prompt, reply, model) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 channel_id,
                 sender_id,
                 sender_label,
                 user_msg,
+                input_prompt,
                 reply,
                 model,
             ),

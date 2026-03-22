@@ -240,7 +240,7 @@ async def on_message(message: discord.Message) -> None:
 
     async with message.channel.typing():
         t1 = time.monotonic()
-        reply = await loop.run_in_executor(
+        reply, input_prompt = await loop.run_in_executor(
             None,
             lambda: call_gemini(
                 history, user_msg, GEMINI_MODEL,
@@ -268,6 +268,7 @@ async def on_message(message: discord.Message) -> None:
             user_msg,
             reply,
             GEMINI_MODEL,
+            input_prompt=input_prompt,
         ),
     )
 
