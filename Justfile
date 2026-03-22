@@ -84,6 +84,12 @@ bot:
 watch:
     find src .gemini -name '*.py' -o -name '*.md' | grep -v __pycache__ | entr -r just bot
 
+# ── Web Viewer ────────────────────────────────────────────────────────────────
+
+# Start local web viewer at http://localhost:8000
+viewer:
+    python src/viewer.py --db db/asaf.db --port 8000
+
 # ── Dev utilities ─────────────────────────────────────────────────────────────
 
 # Type-check all Python files
