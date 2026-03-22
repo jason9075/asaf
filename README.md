@@ -76,7 +76,6 @@ cp .env.example .env
 just ingest        # parse raw Discord JSON → messages.jsonl
 just segment       # split into sessions → sessions.jsonl
 just analyze       # batch-analyse via Gemini → db/asaf.db  (resumable)
-just analyze | tee data/fragments.jsonl   # also stream results to file
 
 # Dry-run (preview prompts, no API calls)
 just analyze-dry
@@ -88,7 +87,33 @@ just inspect 50    # sessions with message_count > 50
 # Utilities
 just status        # row counts per stage
 just clean         # remove data/ (keeps raw_json and db intact)
+just viewer        # local web UI at http://localhost:8000
 ```
+
+### `just profile` — per-session Knowledge Graph extraction (Stage 3 alternative)
+
+`profile.py` is an alternative Stage 3 that sends each session **individually** to the Gemini CLI and writes structured Knowledge Graph Fragments to `db/asaf.db` (`profile_fragments` table). Unlike `analyze.py` (which batches 10 sessions per call and stores raw responses), `profile.py` parses the response into a strict schema immediately and runs sessions concurrently.
+
+Each fragment captures:
+
+| Field | Description |
+|-------|-------------|
+| `session_metadata` | Primary topic, confidence score, urgency level |
+| `participants` | Per-user role (Questioner / Expert / Facilitator…) and contribution weight |
+| `discussion_outline` | Timestamped sections with summaries and resolution status |
+| `indexing_metadata` | Technologies, entities, concepts, action items |
+
+```bash
+just profile                        # analyse all sessions (≥ 10 messages)
+just profile target=<author_id>     # restrict to sessions where author participated
+just profile-dry                    # print prompts only, no API calls
+
+# Advanced flags (passed through to profile.py)
+python src/pipeline/profile.py --min-messages 20 --concurrency 8 --model gemini-3-pro-preview
+just model=gemini-3-pro-preview profile
+```
+
+Runs are **resumable** — already-processed `session_id`s are skipped. Results are browsable via `just viewer` (Fragments tab).
 
 ## Database Schema (`db/asaf.db`)
 
