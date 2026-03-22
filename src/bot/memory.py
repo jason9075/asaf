@@ -173,7 +173,8 @@ def get_member_history(author_id: str, db_path: Path) -> str:
 
 
 def set_silence(db_path: Path, duration_minutes: int, requested_by: str) -> None:
-    """Insert a silence record. Any existing active silence is overwritten."""
+    """Upsert a single silence record — always exactly one row."""
+    from datetime import timedelta
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("""
@@ -185,9 +186,8 @@ def set_silence(db_path: Path, duration_minutes: int, requested_by: str) -> None
             )
         """)
         now = datetime.now()
-        end = datetime(now.year, now.month, now.day, now.hour, now.minute, now.second)
-        from datetime import timedelta
         end = now + timedelta(minutes=duration_minutes)
+        conn.execute("DELETE FROM silence_log")
         conn.execute(
             "INSERT INTO silence_log (start, end, requested_by) VALUES (?, ?, ?)",
             (now.strftime("%Y-%m-%d %H:%M:%S"), end.strftime("%Y-%m-%d %H:%M:%S"), requested_by),
@@ -209,8 +209,7 @@ def end_silence(db_path: Path) -> None:
                 requested_by TEXT NOT NULL
             )
         """)
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        conn.execute("UPDATE silence_log SET end = ? WHERE end > ?", (now, now))
+        conn.execute("DELETE FROM silence_log")
         conn.commit()
     finally:
         conn.close()
