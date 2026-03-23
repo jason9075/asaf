@@ -121,7 +121,8 @@ async def on_message(message: discord.Message) -> None:
 
     # Tool dispatch
     rag_context = ""
-    if mentioned:
+    rag_is_random = False
+    if mentioned or last_was_bot:
         tool_call = await loop.run_in_executor(
             None, lambda: route_tool_cli(user_msg, recent_context)
         )
@@ -133,10 +134,10 @@ async def on_message(message: discord.Message) -> None:
                 # RAG: fetch relevant fragments/sessions as context, then let Gemini answer
                 await message.channel.send("[啟動記憶回溯Skill]")
                 print(f"[bot] recall skill: RAG query={args.get('query', user_msg)!r}", flush=True)
-                rag_context = await loop.run_in_executor(
-                    None, lambda: rag_recall(args.get("query", user_msg), DB_PATH)
+                rag_context, rag_is_random = await loop.run_in_executor(
+                    None, lambda: rag_recall(args.get("query", user_msg), DB_PATH, random_fallback=True, model=GEMINI_MODEL)
                 )
-                print(f"[bot] recall: {len(rag_context)} chars of context retrieved", flush=True)
+                print(f"[bot] recall: {len(rag_context)} chars ({'random' if rag_is_random else 'search'})", flush=True)
                 # Fall through — no return, Gemini will answer using rag_context
 
             elif tool_name == "silence":
@@ -184,7 +185,17 @@ async def on_message(message: discord.Message) -> None:
     if topic_memory:
         memory_parts.append(f"[Topic-related past conversations]\n{topic_memory}")
     if rag_context:
-        memory_parts.append(f"[Recalled from group chat history — use this to answer the question]\n{rag_context}")
+        if rag_is_random:
+            memory_parts.append(
+                "[隨機抽到的群組過去對話片段 — 請以你的角色口吻，把這段回憶主動說出來分享給大家，"
+                "回應中必須自然帶出這件事發生的大概時間（年份或月份），"
+                "內容要具體（人名、事件），不要問使用者，直接講這件事]\n" + rag_context
+            )
+        else:
+            memory_parts.append(
+                "[從群組對話記錄中找到的相關回憶 — 請根據這些資訊回答問題，"
+                "回應中自然帶出事件發生的大概時間]\n" + rag_context
+            )
     memory = "\n\n".join(memory_parts)
 
     sender_profile = member_profiles.get(sender_id, "")
@@ -218,7 +229,7 @@ async def on_message(message: discord.Message) -> None:
     # mentioned → deep analysis (send skill trigger + thorough response)
     # casual    → fetch silently, chat naturally
     urls = URL_RE.findall(user_msg)[:URL_FETCH_LIMIT]
-    if mentioned and not urls:
+    if mentioned and not urls and not rag_context:
         async for hist_msg in message.channel.history(limit=10, before=message):
             found = URL_RE.findall(hist_msg.content)
             if found:

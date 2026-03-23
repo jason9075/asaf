@@ -2,6 +2,7 @@
 import json
 import re
 import sqlite3
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -112,18 +113,94 @@ def search_sessions_for_recall(
     return results
 
 
-def rag_recall(query: str, db_path: Path, limit: int = 5) -> str:
-    """RAG retrieval: search profile_fragments then sessions for relevant context.
+def expand_query_to_english(query: str, model: str | None = None) -> list[str]:
+    """Translate/transliterate Chinese proper nouns in query to English keywords.
 
-    Returns a formatted string ready to inject into model context.
-    Priority: profile_fragments (structured) → sessions (raw content fallback).
+    Returns a list of English search terms to augment the original keyword list.
     """
+    prompt = (
+        "Extract the key proper nouns and topics from this query and return their "
+        "English transliterations or translations. "
+        "Return ONLY comma-separated English terms, no explanation.\n"
+        f"Query: {query}"
+    )
+    cmd = ["gemini"]
+    if model:
+        cmd += ["--model", model]
+    try:
+        result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd="/tmp", timeout=10)
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        raw = result.stdout.strip()
+        return [w for w in re.findall(r"\w+", raw) if len(w) > 1 and w.lower() not in _STOP]
+    except Exception:
+        return []
+
+
+def recall_random_fragment(db_path: Path) -> str:
+    """Pick a random profile_fragment and format it as context for the model."""
     if not db_path.exists():
         return ""
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT session_id, start, session_metadata, discussion_outline, indexing_metadata "
+            "FROM profile_fragments ORDER BY RANDOM() LIMIT 1"
+        ).fetchone()
+        if not row:
+            return ""
+        sid, start, meta_raw, outline_raw, idx_raw = row
+        meta = json.loads(meta_raw)
+        outline: list[dict] = json.loads(outline_raw)
+        idx = json.loads(idx_raw)
+        topic = meta.get("primary_topic", "")
+        summaries = [o["summary"] for o in outline if o.get("summary")]
+        entities = idx.get("entities", [])
+        concepts = idx.get("concepts", [])
+        lines = [f"[Fragment {sid} | {start[:10]}] {topic}"]
+        for s in summaries[:3]:
+            lines.append(f"  概要: {s}")
+        if entities:
+            lines.append(f"  提到的人/事/物: {', '.join(entities[:6])}")
+        if concepts:
+            lines.append(f"  討論概念: {', '.join(concepts[:5])}")
+        return "\n".join(lines)
+    except sqlite3.OperationalError:
+        return ""
+    finally:
+        conn.close()
+
+
+def rag_recall(
+    query: str,
+    db_path: Path,
+    limit: int = 5,
+    random_fallback: bool = False,
+    model: str | None = None,
+) -> tuple[str, bool]:
+    """RAG retrieval: search profile_fragments then sessions for relevant context.
+
+    Returns (context_str, is_random).
+    is_random=True means context came from random sampling, not keyword search.
+    Priority: profile_fragments (structured) → sessions (raw content fallback).
+    If model is provided, Chinese proper nouns are also translated to English keywords.
+    If random_fallback=True and no results found, returns a random fragment instead.
+    """
+    if not db_path.exists():
+        return "", False
 
     words = [w for w in re.findall(r"\w+", query) if len(w) > 1 and w.lower() not in _STOP]
+
+    # Expand with English translation to handle Chinese→English entity name mismatch
+    if model and words:
+        english_words = expand_query_to_english(query, model)
+        if english_words:
+            seen_words: set[str] = set(w.lower() for w in words)
+            words = words + [w for w in english_words if w.lower() not in seen_words]
+            print(f"[memory] rag_recall expanded keywords: {words}", flush=True)
+
     if not words:
-        return ""
+        return (recall_random_fragment(db_path), True) if random_fallback else ("", False)
 
     conn = sqlite3.connect(db_path)
     parts: list[str] = []
@@ -211,7 +288,10 @@ def rag_recall(query: str, db_path: Path, limit: int = 5) -> str:
     finally:
         conn.close()
 
-    return "\n\n".join(parts)
+    if not parts and random_fallback:
+        return recall_random_fragment(db_path), True
+
+    return "\n\n".join(parts), False
 
 
 def format_recall_reply(results: list[dict], guild_id: str, channel_id: str) -> str:
