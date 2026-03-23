@@ -26,12 +26,11 @@ from .gemini import call_gemini, fetch_url_content
 from .memory import (
     build_member_map,
     end_silence,
-    format_recall_reply,
     get_member_history,
     is_silenced,
     log_bot_exchange,
+    rag_recall,
     search_memory,
-    search_sessions_for_recall,
     set_silence,
 )
 from .members import (
@@ -121,6 +120,7 @@ async def on_message(message: discord.Message) -> None:
     recent_context = "\n".join(recent_lines)
 
     # Tool dispatch
+    rag_context = ""
     if mentioned:
         tool_call = await loop.run_in_executor(
             None, lambda: route_tool_cli(user_msg, recent_context)
@@ -128,17 +128,18 @@ async def on_message(message: discord.Message) -> None:
         if tool_call:
             tool_name = tool_call["tool"]
             args = tool_call["args"]
-            channel_id_str = GOSSIP_CHANNEL_ID or str(message.channel.id)
-            guild_id_str = str(message.guild.id) if message.guild else ""
 
             if tool_name == "recall":
-                results = await loop.run_in_executor(
-                    None, lambda: search_sessions_for_recall(args.get("query", user_msg), DB_PATH)
+                # RAG: fetch relevant fragments/sessions as context, then let Gemini answer
+                await message.channel.send("[啟動記憶回溯Skill]")
+                print(f"[bot] recall skill: RAG query={args.get('query', user_msg)!r}", flush=True)
+                rag_context = await loop.run_in_executor(
+                    None, lambda: rag_recall(args.get("query", user_msg), DB_PATH)
                 )
-                await message.channel.send(format_recall_reply(results, guild_id_str, channel_id_str))
-                return
+                print(f"[bot] recall: {len(rag_context)} chars of context retrieved", flush=True)
+                # Fall through — no return, Gemini will answer using rag_context
 
-            if tool_name == "silence":
+            elif tool_name == "silence":
                 action = args.get("action", "start")
                 if action == "end":
                     end_silence(DB_PATH)
@@ -149,7 +150,7 @@ async def on_message(message: discord.Message) -> None:
                     await message.channel.send(f"好，我靜默 {duration} 分鐘 🤫")
                 return
 
-            if tool_name == "joke-rating":
+            elif tool_name == "joke-rating":
                 await message.channel.send("[啟動笑話評分Skill]")
                 skill_body = load_skill_body("joke-rating", SKILLS_DIR)
                 rating = await loop.run_in_executor(
@@ -182,6 +183,8 @@ async def on_message(message: discord.Message) -> None:
         memory_parts.append(f"[Past messages from {sender_label}]\n{sender_history}")
     if topic_memory:
         memory_parts.append(f"[Topic-related past conversations]\n{topic_memory}")
+    if rag_context:
+        memory_parts.append(f"[Recalled from group chat history — use this to answer the question]\n{rag_context}")
     memory = "\n\n".join(memory_parts)
 
     sender_profile = member_profiles.get(sender_id, "")

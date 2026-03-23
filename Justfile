@@ -27,6 +27,7 @@ ingest:
 # Stage 2: group messages into sessions
 segment: ingest
     python {{pipeline}}/segment.py --input {{jsonl}} --output {{segs}}
+    just db-sessions
 
 # Stage 3 (Claude): extract personality fragments — just profile target=<author_id>
 profile: segment
@@ -83,6 +84,12 @@ bot:
 # Watch *.py and *.md for changes and auto-restart bot
 watch:
     find src .gemini -name '*.py' -o -name '*.md' | grep -v __pycache__ | entr -r just bot
+
+# ── DB utilities ──────────────────────────────────────────────────────────────
+
+# Import sessions.jsonl → db/asaf.db (sessions table)
+db-sessions:
+    python src/pipeline/db_sessions.py --input {{segs}} --db db/asaf.db
 
 # ── Web Viewer ────────────────────────────────────────────────────────────────
 

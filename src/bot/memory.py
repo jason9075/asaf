@@ -33,11 +33,14 @@ def search_memory(context: str, db_path: Path) -> str:
         for word in words[:8]:
             if len(seen) >= MEMORY_SESSIONS:
                 break
-            rows = conn.execute(
-                "SELECT session_id, start, messages FROM sessions "
-                "WHERE messages LIKE ? LIMIT 3",
-                (f"%{word}%",),
-            ).fetchall()
+            try:
+                rows = conn.execute(
+                    "SELECT session_id, start, messages FROM sessions "
+                    "WHERE messages LIKE ? LIMIT 3",
+                    (f"%{word}%",),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                break  # sessions table not yet created
             for session_id, start, messages_json in rows:
                 if session_id in seen or len(seen) >= MEMORY_SESSIONS:
                     continue
@@ -109,6 +112,108 @@ def search_sessions_for_recall(
     return results
 
 
+def rag_recall(query: str, db_path: Path, limit: int = 5) -> str:
+    """RAG retrieval: search profile_fragments then sessions for relevant context.
+
+    Returns a formatted string ready to inject into model context.
+    Priority: profile_fragments (structured) → sessions (raw content fallback).
+    """
+    if not db_path.exists():
+        return ""
+
+    words = [w for w in re.findall(r"\w+", query) if len(w) > 1 and w.lower() not in _STOP]
+    if not words:
+        return ""
+
+    conn = sqlite3.connect(db_path)
+    parts: list[str] = []
+    seen: set[str] = set()
+
+    try:
+        # ── 1. profile_fragments (structured RAG) ─────────────────────────────
+        for word in words[:8]:
+            if len(seen) >= limit:
+                break
+            like = f"%{word}%"
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT session_id, start, session_metadata,
+                           discussion_outline, indexing_metadata
+                    FROM profile_fragments
+                    WHERE json_extract(session_metadata, '$.primary_topic') LIKE ?
+                       OR json_extract(indexing_metadata, '$.entities')     LIKE ?
+                       OR json_extract(indexing_metadata, '$.concepts')     LIKE ?
+                       OR json_extract(indexing_metadata, '$.technologies') LIKE ?
+                    ORDER BY start DESC LIMIT 5
+                    """,
+                    (like, like, like, like),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+
+            for sid, start, meta_raw, outline_raw, idx_raw in rows:
+                if sid in seen or len(seen) >= limit:
+                    continue
+                seen.add(sid)
+                meta = json.loads(meta_raw)
+                outline: list[dict] = json.loads(outline_raw)
+                idx = json.loads(idx_raw)
+
+                topic = meta.get("primary_topic", "")
+                summaries = [o["summary"] for o in outline if o.get("summary")]
+                entities = idx.get("entities", [])
+                concepts = idx.get("concepts", [])
+                action_items = idx.get("action_items", [])
+
+                lines = [f"[Fragment {sid} | {start[:10]}] {topic}"]
+                for s in summaries[:3]:
+                    lines.append(f"  概要: {s}")
+                if entities:
+                    lines.append(f"  提到的人/事/物: {', '.join(entities[:6])}")
+                if concepts:
+                    lines.append(f"  討論概念: {', '.join(concepts[:5])}")
+                if action_items:
+                    lines.append(f"  行動項目: {', '.join(action_items[:3])}")
+                parts.append("\n".join(lines))
+
+        # ── 2. sessions raw content (fallback) ────────────────────────────────
+        if len(seen) < limit:
+            for word in words[:6]:
+                if len(seen) >= limit:
+                    break
+                try:
+                    rows = conn.execute(
+                        "SELECT session_id, start, messages FROM sessions "
+                        "WHERE messages LIKE ? ORDER BY start DESC LIMIT 3",
+                        (f"%{word}%",),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    break  # sessions table doesn't exist
+
+                for sid, start, messages_json in rows:
+                    if sid in seen or len(seen) >= limit:
+                        continue
+                    seen.add(sid)
+                    msgs: list[dict] = json.loads(messages_json)
+                    hits = [
+                        m for m in msgs
+                        if word.lower() in m.get("content", "").lower()
+                    ][:4]
+                    if not hits:
+                        continue
+                    lines = [f"[Session {sid} | {start[:10]}]"]
+                    for m in hits:
+                        content = m["content"][:120]
+                        lines.append(f"  [{m['timestamp'][:10]}] {m['display_name']}: {content}")
+                    parts.append("\n".join(lines))
+
+    finally:
+        conn.close()
+
+    return "\n\n".join(parts)
+
+
 def format_recall_reply(results: list[dict], guild_id: str, channel_id: str) -> str:
     if not results:
         return "找不到相關的過去對話 🤔"
@@ -153,11 +258,14 @@ def get_member_history(author_id: str, db_path: Path) -> str:
     conn = sqlite3.connect(db_path)
     snippets: list[str] = []
     try:
-        rows = conn.execute(
-            "SELECT start, messages FROM sessions "
-            "WHERE messages LIKE ? ORDER BY start DESC LIMIT ?",
-            (f'%"author_id": "{author_id}"%', MEMORY_SESSIONS),
-        ).fetchall()
+        try:
+            rows = conn.execute(
+                "SELECT start, messages FROM sessions "
+                "WHERE messages LIKE ? ORDER BY start DESC LIMIT ?",
+                (f'%"author_id": "{author_id}"%', MEMORY_SESSIONS),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return ""  # sessions table not yet created
         for start, messages_json in rows:
             msgs: list[dict] = json.loads(messages_json)
             hits = [m for m in msgs if m.get("author_id") == author_id][:MEMORY_MSGS_PER_SESSION]
