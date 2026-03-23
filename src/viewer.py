@@ -40,11 +40,13 @@ def search_sessions(
 
 
 def search_messages(
-    messages: list[dict], q: str, author: str, page: int
+    messages: list[dict], q: str, author: str, session_id: str, page: int
 ) -> tuple[list[dict], int]:
     q = q.lower()
     author = author.lower()
     results = messages
+    if session_id:
+        results = [m for m in results if m.get("session_id") == session_id]
     if q:
         results = [m for m in results if q in m.get("content", "").lower()]
     if author:
@@ -86,6 +88,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 self._handle_session(sid)
             elif path == "/api/messages":
                 self._handle_messages(qs)
+            elif path == "/api/messages/context":
+                self._handle_message_context(qs)
             else:
                 self._send(404, b"Not found")
         except Exception as e:
@@ -228,9 +232,42 @@ class ViewerHandler(BaseHTTPRequestHandler):
     def _handle_messages(self, qs: dict) -> None:
         q = qs.get("q", [""])[0]
         author = qs.get("author", [""])[0]
+        session_id = qs.get("sid", [""])[0]
         page = int(qs.get("page", ["0"])[0])
-        items, total = search_messages(self.messages, q, author, page)
+        items, total = search_messages(self.messages, q, author, session_id, page)
         self._json({"items": items, "total": total, "page": page})
+
+    def _handle_message_context(self, qs: dict) -> None:
+        sid = qs.get("sid", [""])[0]
+        ws = int(qs.get("ws", ["-1"])[0])
+        we = int(qs.get("we", ["-1"])[0])
+        CONTEXT = 50
+
+        messages = self.messages
+        total = len(messages)
+        session_indices = [i for i, m in enumerate(messages) if m.get("session_id") == sid]
+
+        if not session_indices:
+            self._json({"items": [], "window_start": 0, "window_end": 0, "total": total})
+            return
+
+        if ws == -1:
+            ws = max(0, session_indices[0] - CONTEXT)
+            we = min(total, session_indices[-1] + CONTEXT + 1)
+        else:
+            ws = max(0, ws)
+            we = min(total, we)
+
+        items = [
+            {**m, "in_session": m.get("session_id") == sid}
+            for m in messages[ws:we]
+        ]
+        self._json({
+            "items": items,
+            "window_start": ws,
+            "window_end": we,
+            "total": total,
+        })
 
     def _json(self, data: object, status: int = 200) -> None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -288,7 +325,10 @@ HTML = r"""<!DOCTYPE html>
   .outline-item .title{color:#b0c8e0;font-weight:bold;margin:2px 0}
   .outline-item .summary{color:#ccc}
   .outline-item.resolved::before{content:"✓ ";color:#8fc08f}
-  .msg-list{max-height:500px;overflow-y:auto}
+  .msg-list{overflow-y:auto;max-height:calc(100vh - 180px)}
+  .msg.highlighted{background:#1a2a1a;border-left:3px solid #8fc08f;padding-left:5px}
+  .ctx-btn{width:100%;background:#1e1e1e;border:1px solid #333;color:#888;padding:5px;cursor:pointer;font-family:monospace;font-size:12px;border-radius:3px}
+  .ctx-btn:hover{background:#2a2a2a;color:#ccc}
   .msg{padding:4px 0;border-bottom:1px solid #222;display:flex;gap:8px}
   .msg .ts{color:#555;min-width:140px;flex-shrink:0}
   .msg .author{color:#7cb4f0;min-width:120px;flex-shrink:0}
@@ -373,18 +413,19 @@ HTML = r"""<!DOCTYPE html>
 
 <div id="pane-messages" style="display:none">
   <div class="search-bar">
-    <input id="msg-q" placeholder="Search content…" onkeydown="if(event.key==='Enter')msgSearch()" style="flex:2">
-    <input id="msg-author" placeholder="Author filter…" onkeydown="if(event.key==='Enter')msgSearch()">
-    <button onclick="msgSearch()">Search</button>
+    <input id="msg-q" placeholder="Search content…" oninput="msgDebounce()" style="flex:2">
+    <input id="msg-author" placeholder="Author filter…" oninput="msgDebounce()">
   </div>
   <main>
-    <div class="count" id="msg-count"></div>
-    <div id="msg-list" class="msg-list"></div>
-    <div class="pagination">
-      <button id="msg-prev" onclick="msgPage(-1)" disabled>◀ Prev</button>
-      <span id="msg-page-info"></span>
-      <button id="msg-next" onclick="msgPage(1)" disabled>Next ▶</button>
+    <div class="count" id="msg-count">
+      <span id="msg-count-text"></span>
+      <span id="msg-session-badge" style="display:none;margin-left:8px;background:#2a3a2a;color:#8fc08f;padding:2px 8px;border-radius:3px;font-size:11px"></span>
+      <button id="msg-session-clear" style="display:none;margin-left:6px;background:none;border:1px solid #444;color:#888;cursor:pointer;font-size:11px;padding:1px 6px;border-radius:3px" onclick="clearMsgSession()">✕ clear</button>
     </div>
+    <div id="msg-load-older" style="display:none;padding:4px 0"><button class="ctx-btn" onclick="msgLoadOlder()">▲ Load 50 older</button></div>
+    <div id="msg-list" class="msg-list"></div>
+    <div id="msg-loading" style="display:none;text-align:center;color:#555;padding:8px;font-size:12px">Loading…</div>
+    <div id="msg-load-newer" style="display:none;padding:4px 0"><button class="ctx-btn" onclick="msgLoadNewer()">▼ Load 50 newer</button></div>
   </main>
 </div>
 
@@ -576,7 +617,9 @@ async function sessLoad() {
     : data.items.map(s => `
       <tr class="clickable" onclick="sessToggle('${esc(s.session_id)}')">
         <td>${esc(s.session_id)}</td>
-        <td style="white-space:nowrap;color:#888">${esc(s.start.slice(0,16))} →<br>${esc(s.end.slice(0,16))}</td>
+        <td style="white-space:nowrap;color:#888">
+          <a href="#" onclick="event.preventDefault();event.stopPropagation();goToMessages('${esc(s.session_id)}')">${esc(s.start.slice(0,16))}</a> →<br>${esc(s.end.slice(0,16))}
+        </td>
         <td>${s.message_count}</td>
       </tr>
       <tr id="sess-detail-${esc(s.session_id)}" style="display:none">
@@ -619,39 +662,183 @@ function renderSessDetail(s) {
 }
 
 // ── Messages ──────────────────────────────────────────────────────────────────
-let msgState = {page:0, q:'', author:''};
+let msgState = {page:0, q:'', author:'', sessionId:''};
+let msgTotal = 0;
+let msgFetching = false;
+let msgDebounceTimer = null;
 
-function msgSearch() {
-  msgState.q = document.getElementById('msg-q').value.trim();
-  msgState.author = document.getElementById('msg-author').value.trim();
+function msgDebounce() {
+  clearTimeout(msgDebounceTimer);
+  msgDebounceTimer = setTimeout(() => {
+    msgState.q      = document.getElementById('msg-q').value.trim();
+    msgState.author = document.getElementById('msg-author').value.trim();
+    msgState.page   = 0;
+    msgCtxClear();
+    msgLoad(false);
+  }, 300);
+}
+
+// ── Context mode (session-anchored view) ──────────────────────────────────────
+let msgCtx = {active: false, sid: '', windowStart: 0, windowEnd: 0, total: 0};
+
+function msgCtxSetControls() {
+  document.getElementById('msg-load-older').style.display =
+    msgCtx.active && msgCtx.windowStart > 0 ? 'block' : 'none';
+  document.getElementById('msg-load-newer').style.display =
+    msgCtx.active && msgCtx.windowEnd < msgCtx.total ? 'block' : 'none';
+}
+
+function msgCtxClear() {
+  msgCtx.active = false;
+  document.getElementById('msg-load-older').style.display = 'none';
+  document.getElementById('msg-load-newer').style.display = 'none';
+}
+
+function renderMsgItems(items) {
+  return items.map(m => `
+    <div class="msg${m.in_session ? ' highlighted' : ''}">
+      <span class="ts">${esc(m.timestamp)}</span>
+      <span class="author">${esc(m.display_name)}</span>
+      <span class="content">${esc(m.content)}</span>
+    </div>
+  `).join('');
+}
+
+async function msgLoadContext(sid) {
+  document.getElementById('msg-loading').style.display = 'block';
+  try {
+    const data = await (await fetch(`/api/messages/context?sid=${encodeURIComponent(sid)}`)).json();
+    msgCtx = {active: true, sid, windowStart: data.window_start, windowEnd: data.window_end, total: data.total};
+
+    const list = document.getElementById('msg-list');
+    list.innerHTML = renderMsgItems(data.items);
+
+    // Scroll so first highlighted message is near the top
+    const firstHL = list.querySelector('.msg.highlighted');
+    if (firstHL) firstHL.scrollIntoView({block: 'start'});
+
+    document.getElementById('msg-count-text').textContent = `${data.total} messages`;
+    msgCtxSetControls();
+  } finally {
+    document.getElementById('msg-loading').style.display = 'none';
+  }
+}
+
+async function msgLoadOlder() {
+  const ws = Math.max(0, msgCtx.windowStart - 50);
+  const we = msgCtx.windowStart;
+  if (ws >= we) return;
+  document.getElementById('msg-loading').style.display = 'block';
+  try {
+    const data = await (await fetch(
+      `/api/messages/context?sid=${encodeURIComponent(msgCtx.sid)}&ws=${ws}&we=${we}`
+    )).json();
+    const list = document.getElementById('msg-list');
+    const prevH = list.scrollHeight;
+    list.insertAdjacentHTML('afterbegin', renderMsgItems(data.items));
+    list.scrollTop += list.scrollHeight - prevH;  // preserve scroll position
+    msgCtx.windowStart = ws;
+    msgCtxSetControls();
+  } finally {
+    document.getElementById('msg-loading').style.display = 'none';
+  }
+}
+
+async function msgLoadNewer() {
+  const ws = msgCtx.windowEnd;
+  const we = Math.min(msgCtx.total, msgCtx.windowEnd + 50);
+  if (ws >= we) return;
+  document.getElementById('msg-loading').style.display = 'block';
+  try {
+    const data = await (await fetch(
+      `/api/messages/context?sid=${encodeURIComponent(msgCtx.sid)}&ws=${ws}&we=${we}`
+    )).json();
+    const list = document.getElementById('msg-list');
+    list.insertAdjacentHTML('beforeend', renderMsgItems(data.items));
+    msgCtx.windowEnd = we;
+    msgCtxSetControls();
+  } finally {
+    document.getElementById('msg-loading').style.display = 'none';
+  }
+}
+
+function clearMsgSession() {
+  msgState.sessionId = '';
   msgState.page = 0;
-  msgLoad();
+  msgCtxClear();
+  msgLoad(false);
 }
-function msgPage(dir) { msgState.page += dir; msgLoad(); }
 
-async function msgLoad() {
-  const {q, author, page} = msgState;
-  const res = await fetch(`/api/messages?q=${encodeURIComponent(q)}&author=${encodeURIComponent(author)}&page=${page}`);
-  const data = await res.json();
-  document.getElementById('msg-count').textContent = `${data.total} messages`;
-  updatePager('msg-prev','msg-next','msg-page-info', page, data.total);
+async function goToMessages(sid) {
+  showTab('messages');
+  document.getElementById('msg-q').value      = '';
+  document.getElementById('msg-author').value = '';
+  msgState.q         = '';
+  msgState.author    = '';
+  msgState.sessionId = sid;
 
-  const list = document.getElementById('msg-list');
-  list.innerHTML = data.items.length === 0
-    ? '<div class="empty">No results</div>'
-    : data.items.map(m => `
-      <div class="msg">
-        <span class="ts">${esc(m.timestamp)}</span>
-        <span class="author">${esc(m.display_name)}</span>
-        <span class="content">${esc(m.content)}</span>
-      </div>
-    `).join('');
+  const badge    = document.getElementById('msg-session-badge');
+  const clearBtn = document.getElementById('msg-session-clear');
+  badge.textContent      = sid;
+  badge.style.display    = 'inline';
+  clearBtn.style.display = 'inline';
+
+  await msgLoadContext(sid);
 }
+
+
+async function msgLoad(append = false) {
+  if (append && msgFetching) return;
+  msgFetching = true;
+  document.getElementById('msg-loading').style.display = 'block';
+  try {
+    const {q, author, page, sessionId} = msgState;
+    const params = new URLSearchParams({q, author, sid: sessionId, page});
+    const data = await (await fetch(`/api/messages?${params}`)).json();
+    msgTotal = data.total;
+
+    const badge    = document.getElementById('msg-session-badge');
+    const clearBtn = document.getElementById('msg-session-clear');
+    if (sessionId) {
+      badge.textContent    = sessionId;
+      badge.style.display  = 'inline';
+      clearBtn.style.display = 'inline';
+    } else {
+      badge.style.display    = 'none';
+      clearBtn.style.display = 'none';
+    }
+    document.getElementById('msg-count-text').textContent = `${data.total} messages`;
+
+    const list = document.getElementById('msg-list');
+    if (!append) {
+      list.innerHTML = data.items.length === 0
+        ? '<div class="empty">No results</div>'
+        : renderMsgItems(data.items);
+      list.scrollTop = 0;
+    } else {
+      list.insertAdjacentHTML('beforeend', renderMsgItems(data.items));
+    }
+  } finally {
+    document.getElementById('msg-loading').style.display = 'none';
+    msgFetching = false;
+  }
+}
+
+// Infinite scroll via scroll event on msg-list
+document.getElementById('msg-list').addEventListener('scroll', function() {
+  if (msgFetching) return;
+  if ((msgState.page + 1) * 50 >= msgTotal) return;
+  if (this.scrollTop + this.clientHeight >= this.scrollHeight - 120) {
+    msgState.page++;
+    msgLoad(true);
+  }
+});
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 initFragMeta();
 fragLoad();
 sessLoad();
+msgLoad();
 </script>
 </body>
 </html>
@@ -683,6 +870,16 @@ def main() -> None:
             messages.extend(sess.get("messages", []))
     else:
         messages = raw_msgs
+
+    # Tag each message with its session_id using the sessions data
+    msg_to_session: dict[str, str] = {
+        m["id"]: sess["session_id"]
+        for sess in sessions
+        for m in sess.get("messages", [])
+    }
+    for m in messages:
+        if "session_id" not in m:
+            m["session_id"] = msg_to_session.get(m.get("id", ""), "")
     print(f"  {len(messages)} messages loaded")
 
     # Inject into handler class
