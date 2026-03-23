@@ -175,6 +175,7 @@ async def extract_fragment(
         "session_id": session["session_id"],
         "start": session["start"],
         "end": session["end"],
+        "model": model,
         **fragment_data,
     }
 
@@ -200,7 +201,8 @@ CREATE TABLE IF NOT EXISTS profile_fragments (
     participants       TEXT NOT NULL,
     discussion_outline TEXT NOT NULL,
     indexing_metadata  TEXT NOT NULL,
-    created_at         TEXT NOT NULL
+    created_at         TEXT NOT NULL,
+    model              TEXT
 );
 """
 
@@ -209,6 +211,11 @@ def init_db(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.execute(_DDL)
+    # Migration: add model column to existing tables that predate this column
+    try:
+        conn.execute("ALTER TABLE profile_fragments ADD COLUMN model TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.commit()
     return conn
 
@@ -224,8 +231,8 @@ def save_fragment(conn: sqlite3.Connection, fragment: dict[str, Any]) -> None:
         """
         INSERT OR REPLACE INTO profile_fragments
             (session_id, start, end, session_metadata, participants,
-             discussion_outline, indexing_metadata, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             discussion_outline, indexing_metadata, created_at, model)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             fragment["session_id"],
@@ -236,6 +243,7 @@ def save_fragment(conn: sqlite3.Connection, fragment: dict[str, Any]) -> None:
             json.dumps(fragment.get("discussion_outline", []), ensure_ascii=False),
             json.dumps(fragment.get("indexing_metadata", {}), ensure_ascii=False),
             datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            fragment.get("model"),
         ),
     )
     conn.commit()
