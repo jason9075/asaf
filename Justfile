@@ -86,9 +86,9 @@ watch:
 
 # ── Web Viewer ────────────────────────────────────────────────────────────────
 
-# Start local web viewer at http://localhost:8000
+# Start local web viewer at http://localhost:8000 (auto-restart on file change)
 viewer:
-    python src/viewer.py --db db/asaf.db --port 8000
+    find src -name '*.py' | grep -v __pycache__ | entr -r python src/viewer.py --db db/asaf.db --port 8000
 
 # ── Dev utilities ─────────────────────────────────────────────────────────────
 

@@ -74,6 +74,8 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 self._handle_index()
             elif path == "/api/fragments":
                 self._handle_fragments(qs)
+            elif path == "/api/fragments/meta":
+                self._handle_fragment_meta()
             elif path.startswith("/api/fragments/"):
                 sid = path[len("/api/fragments/"):]
                 self._handle_fragment(sid)
@@ -99,36 +101,60 @@ class ViewerHandler(BaseHTTPRequestHandler):
 
     def _handle_fragments(self, qs: dict) -> None:
         q = qs.get("q", [""])[0]
+        urgency = qs.get("urgency", [""])[0]
+        model_filter = qs.get("model", [""])[0]
+        conf_sort = qs.get("conf_sort", [""])[0]   # "asc" | "desc" | ""
+        start_sort = qs.get("start_sort", [""])[0]  # "asc" | "desc" | ""
         page = int(qs.get("page", ["0"])[0])
-        like = f"%{q}%"
-        cur = self.conn.cursor()
+
+        conditions: list[str] = []
+        params: list[str] = []
+
         if q:
-            cur.execute(
-                """
-                SELECT session_id, start, end, session_metadata, indexing_metadata
-                FROM profile_fragments
-                WHERE json_extract(session_metadata, '$.primary_topic') LIKE ?
-                   OR json_extract(indexing_metadata, '$.technologies') LIKE ?
-                   OR json_extract(indexing_metadata, '$.entities') LIKE ?
-                   OR json_extract(indexing_metadata, '$.concepts') LIKE ?
-                ORDER BY start DESC
-                """,
-                (like, like, like, like),
+            like = f"%{q}%"
+            conditions.append(
+                "(json_extract(session_metadata,'$.primary_topic') LIKE ?"
+                " OR json_extract(indexing_metadata,'$.technologies') LIKE ?"
+                " OR json_extract(indexing_metadata,'$.entities') LIKE ?"
+                " OR json_extract(indexing_metadata,'$.concepts') LIKE ?)"
             )
+            params.extend([like, like, like, like])
+
+        if urgency:
+            conditions.append("json_extract(session_metadata,'$.urgency_level') = ?")
+            params.append(urgency)
+
+        if model_filter == "__null__":
+            conditions.append("model IS NULL")
+        elif model_filter:
+            conditions.append("model = ?")
+            params.append(model_filter)
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        if conf_sort == "asc":
+            order = "ORDER BY CAST(json_extract(session_metadata,'$.confidence_score') AS REAL) ASC"
+        elif conf_sort == "desc":
+            order = "ORDER BY CAST(json_extract(session_metadata,'$.confidence_score') AS REAL) DESC"
+        elif start_sort == "asc":
+            order = "ORDER BY start ASC"
+        elif start_sort == "desc":
+            order = "ORDER BY start DESC"
         else:
-            cur.execute(
-                """
-                SELECT session_id, start, end, session_metadata, indexing_metadata
-                FROM profile_fragments
-                ORDER BY start DESC
-                """
-            )
+            order = "ORDER BY start DESC"
+
+        sql = (
+            f"SELECT session_id, start, end, session_metadata, indexing_metadata, model"
+            f" FROM profile_fragments {where} {order}"
+        )
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
         rows = cur.fetchall()
         total = len(rows)
         page_rows = rows[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
         items = []
         for row in page_rows:
-            sid, start, end, meta_raw, idx_raw = row
+            sid, start, end, meta_raw, idx_raw, model = row
             meta = json.loads(meta_raw)
             idx = json.loads(idx_raw)
             items.append({
@@ -138,12 +164,26 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 "primary_topic": meta.get("primary_topic", ""),
                 "confidence": meta.get("confidence_score", ""),
                 "urgency": meta.get("urgency_level", ""),
+                "model": model or "",
                 "technologies": idx.get("technologies", []),
                 "entities": idx.get("entities", []),
                 "concepts": idx.get("concepts", []),
                 "action_items": idx.get("action_items", []),
             })
         self._json({"items": items, "total": total, "page": page})
+
+    def _handle_fragment_meta(self) -> None:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT json_extract(session_metadata,'$.urgency_level')"
+            " FROM profile_fragments"
+        )
+        urgencies = sorted(r[0] for r in cur.fetchall() if r[0])
+        cur.execute("SELECT DISTINCT model FROM profile_fragments")
+        rows = cur.fetchall()
+        models = sorted(r[0] for r in rows if r[0] is not None)
+        has_null = any(r[0] is None for r in rows)
+        self._json({"urgencies": urgencies, "models": models, "has_null": has_null})
 
     def _handle_fragment(self, session_id: str) -> None:
         cur = self.conn.cursor()
@@ -279,13 +319,26 @@ HTML = r"""<!DOCTYPE html>
 <div id="pane-fragments">
   <div class="search-bar">
     <input id="frag-q" placeholder="Search topic / tech / entity / concept…" onkeydown="if(event.key==='Enter')fragSearch()">
+    <select id="frag-urgency" onchange="fragSearch()">
+      <option value="">All urgency</option>
+      <option value="low">low</option>
+      <option value="medium">medium</option>
+      <option value="high">high</option>
+    </select>
+    <select id="frag-model" onchange="fragSearch()">
+      <option value="">All models</option>
+    </select>
     <button onclick="fragSearch()">Search</button>
   </div>
   <main>
     <div class="count" id="frag-count"></div>
     <table>
       <thead><tr>
-        <th>Session</th><th>Start → End</th><th>Topic</th><th>Conf</th><th>Urgency</th><th>Tags</th>
+        <th>Session</th>
+        <th id="th-start" onclick="fragToggleStartSort()" style="cursor:pointer;user-select:none">Start → End <span id="start-sort-icon">▼</span></th>
+        <th>Topic</th>
+        <th id="th-conf" onclick="fragToggleConfSort()" style="cursor:pointer;user-select:none">Conf <span id="conf-sort-icon"></span></th>
+        <th>Urgency</th><th>Model</th><th>Tags</th>
       </tr></thead>
       <tbody id="frag-tbody"></tbody>
     </table>
@@ -364,36 +417,70 @@ function updatePager(prevId, nextId, infoId, page, total) {
 }
 
 // ── Fragments ─────────────────────────────────────────────────────────────────
-let fragState = {page:0, q:''};
+let fragState = {page:0, q:'', urgency:'', model:'', confSort:'', startSort:'desc'};
 
 function fragSearch() {
-  fragState.q = document.getElementById('frag-q').value.trim();
-  fragState.page = 0;
+  fragState.q       = document.getElementById('frag-q').value.trim();
+  fragState.urgency = document.getElementById('frag-urgency').value;
+  fragState.model   = document.getElementById('frag-model').value;
+  fragState.page    = 0;
   fragLoad();
 }
 function fragPage(dir) { fragState.page += dir; fragLoad(); }
+function fragToggleConfSort() {
+  fragState.confSort  = fragState.confSort === '' ? 'asc' : fragState.confSort === 'asc' ? 'desc' : '';
+  fragState.startSort = '';
+  fragState.page = 0;
+  fragLoad();
+}
+function fragToggleStartSort() {
+  fragState.startSort = fragState.startSort === 'desc' ? 'asc' : 'desc';
+  fragState.confSort  = '';
+  fragState.page = 0;
+  fragLoad();
+}
+
+async function initFragMeta() {
+  const data = await (await fetch('/api/fragments/meta')).json();
+  const sel = document.getElementById('frag-model');
+  if (data.has_null) {
+    const opt = document.createElement('option');
+    opt.value = '__null__'; opt.textContent = '(none)';
+    sel.appendChild(opt);
+  }
+  data.models.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m; opt.textContent = m;
+    sel.appendChild(opt);
+  });
+}
 
 async function fragLoad() {
-  const {q, page} = fragState;
-  const res = await fetch(`/api/fragments?q=${encodeURIComponent(q)}&page=${page}`);
+  const {q, page, urgency, model, confSort, startSort} = fragState;
+  const params = new URLSearchParams({q, page, urgency, model, conf_sort: confSort, start_sort: startSort});
+  const res = await fetch(`/api/fragments?${params}`);
   const data = await res.json();
+  const icons = {'asc':'▲', 'desc':'▼', '':''};
+  document.getElementById('conf-sort-icon').textContent = icons[confSort];
+  document.getElementById('start-sort-icon').textContent = icons[startSort];
   document.getElementById('frag-count').textContent = `${data.total} fragments`;
   updatePager('frag-prev','frag-next','frag-page-info', page, data.total);
 
   const tbody = document.getElementById('frag-tbody');
   tbody.innerHTML = data.items.length === 0
-    ? '<tr><td colspan="6" class="empty">No results</td></tr>'
+    ? '<tr><td colspan="7" class="empty">No results</td></tr>'
     : data.items.map(f => `
       <tr class="clickable" onclick="fragToggle('${esc(f.session_id)}')">
-        <td><a href="#" onclick="event.stopPropagation();goToSession('${esc(f.session_id)}')">${esc(f.session_id)}</a></td>
+        <td><a href="#" onclick="event.preventDefault();event.stopPropagation();goToSession('${esc(f.session_id)}')">${esc(f.session_id)}</a></td>
         <td style="white-space:nowrap;color:#888">${esc(f.start.slice(0,16))} →<br>${esc(f.end.slice(0,16))}</td>
         <td>${esc(f.primary_topic)}</td>
         <td class="conf">${f.confidence || ''}</td>
         <td class="${urgencyClass(f.urgency)}">${esc(f.urgency)}</td>
+        <td style="color:#777;font-size:11px">${esc(f.model)}</td>
         <td>${tags(f.technologies,'tech')}${tags(f.entities,'entity')}${tags(f.concepts,'concept')}</td>
       </tr>
       <tr id="detail-${esc(f.session_id)}" style="display:none">
-        <td colspan="6"><div class="detail open" id="detail-div-${esc(f.session_id)}">Loading…</div></td>
+        <td colspan="7"><div class="detail open" id="detail-div-${esc(f.session_id)}">Loading…</div></td>
       </tr>
     `).join('');
 }
@@ -403,8 +490,8 @@ async function goToSession(sid) {
   document.getElementById('sess-q').value = sid;
   sessState.q = sid;
   sessState.page = 0;
+  openSess = null;  // clear stale ref before DOM re-render
   await sessLoad();
-  // auto-expand the matched session
   const row = document.getElementById('sess-detail-'+sid);
   if (row && row.style.display === 'none') sessToggle(sid);
 }
@@ -508,7 +595,8 @@ async function sessToggle(sid) {
     return;
   }
   if (openSess) {
-    document.getElementById('sess-detail-'+openSess).style.display = 'none';
+    const prevRow = document.getElementById('sess-detail-'+openSess);
+    if (prevRow) prevRow.style.display = 'none';
   }
   openSess = sid;
   row.style.display = '';
@@ -561,6 +649,7 @@ async function msgLoad() {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
+initFragMeta();
 fragLoad();
 sessLoad();
 </script>
